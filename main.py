@@ -672,7 +672,7 @@ def run(config: dict, export_path: str = None) -> None:
                                 traded_at=traded_at,
                             )
                     except Exception as e:
-                        logger.debug(f"Watched trade persist failed: {e}")
+                        logger.warning(f"Watched trade persist failed: {e}")
 
                 print(format_watch_terminal_alert(watch_line, market_title,
                                                   position, amount_usd, price, ts))
@@ -727,7 +727,7 @@ def run(config: dict, export_path: str = None) -> None:
                             traded_at=traded_at,
                         )
                 except Exception as e:
-                    logger.debug(f"Trade persist failed: {e}")
+                    logger.warning(f"Trade persist failed: {e}")
 
             # Export to CSV/JSON if requested
             if export_path:

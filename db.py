@@ -39,7 +39,8 @@ class WhaleTrade(Base):
     __tablename__ = "whale_trades"
 
     id = Column(Integer, primary_key=True)
-    trade_id = Column(String(128), unique=True, index=True)
+    # txHash-asset-size: asset ids are ~77-digit ints, so this runs ~150+ chars
+    trade_id = Column(String(256), unique=True, index=True)
     condition_id = Column(String(128), index=True)
     market_title = Column(String(512))
     category = Column(String(128), index=True)
@@ -76,7 +77,7 @@ class WatchedTrade(Base):
     __tablename__ = "watched_trades"
 
     id = Column(Integer, primary_key=True)
-    trade_id = Column(String(160), unique=True, index=True)
+    trade_id = Column(String(256), unique=True, index=True)
     address = Column(String(64), index=True)
     condition_id = Column(String(128), index=True)
     market_title = Column(String(512))
