@@ -8,7 +8,7 @@ SQLite by default (zero setup), Postgres when DATABASE_URL is set
 
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import (
     create_engine,
@@ -70,6 +70,16 @@ class WatchedAddress(Base):
     address = Column(String(64), primary_key=True)
     label = Column(String(128), default="")
     added_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class TrackerStatus(Base):
+    """Single-row heartbeat the tracker updates every poll cycle, so the
+    dashboard can tell when the tracker has silently died."""
+    __tablename__ = "tracker_status"
+
+    id = Column(Integer, primary_key=True)  # always 1
+    last_poll_at = Column(DateTime)
+    interval_seconds = Column(Integer, default=30)
 
 
 class WatchedTrade(Base):
@@ -159,6 +169,34 @@ def upsert_wallet(session, address: str, amount_usd: float,
                                     recurring_threshold)
     session.commit()
     return wallet
+
+
+def heartbeat(session, interval_seconds: int) -> None:
+    """Record that the tracker just completed a poll cycle."""
+    row = session.get(TrackerStatus, 1)
+    if row is None:
+        row = TrackerStatus(id=1)
+        session.add(row)
+    row.last_poll_at = datetime.now(timezone.utc)
+    row.interval_seconds = interval_seconds
+    session.commit()
+
+
+def tracker_health(session) -> dict:
+    """
+    {'alive': True/False/None, 'last_poll_at': datetime|None, 'stale_seconds': float|None}
+    alive is None when the tracker has never reported (fresh install).
+    Stale = no heartbeat for 3 poll intervals (min 120s).
+    """
+    row = session.get(TrackerStatus, 1)
+    if row is None or row.last_poll_at is None:
+        return {"alive": None, "last_poll_at": None, "stale_seconds": None}
+    last = row.last_poll_at
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - last).total_seconds()
+    allowed = max(3 * (row.interval_seconds or 30), 120)
+    return {"alive": age <= allowed, "last_poll_at": last, "stale_seconds": age}
 
 
 def get_watched_addresses(session) -> list:
@@ -281,6 +319,86 @@ def market_convergence(session, limit_trades: int = 2000) -> list:
         })
     result.sort(key=lambda m: (-m["wallet_count"], -m["total"]))
     return result
+
+
+def market_side_whales(session, condition_id: str, side: str,
+                       window_minutes: int = 60) -> dict:
+    """Distinct whale wallets (and their volume) on one side of a market
+    within the trailing window — the 'smart money consensus' signal."""
+    since = (datetime.now(timezone.utc)
+             - timedelta(minutes=window_minutes)).replace(tzinfo=None)
+    count, volume = (
+        session.query(
+            func.count(func.distinct(WhaleTrade.wallet)),
+            func.coalesce(func.sum(WhaleTrade.amount_usd), 0),
+        )
+        .filter(
+            WhaleTrade.condition_id == condition_id,
+            WhaleTrade.side == side,
+            WhaleTrade.traded_at >= since,
+            WhaleTrade.wallet != "",
+            WhaleTrade.wallet.isnot(None),
+        )
+        .one()
+    )
+    return {"wallets": count, "volume": float(volume)}
+
+
+def wallet_leaderboard(session, days: int = 7, limit: int = 50) -> list:
+    """
+    Top whale wallets by volume over the trailing window.
+    Returns [{address, trades, volume, biggest, last_traded, tag}].
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None)
+    volume = func.coalesce(func.sum(WhaleTrade.amount_usd), 0)
+    rows = (
+        session.query(
+            WhaleTrade.wallet,
+            func.count(WhaleTrade.id),
+            volume,
+            func.max(WhaleTrade.amount_usd),
+            func.max(WhaleTrade.traded_at),
+        )
+        .filter(WhaleTrade.wallet != "", WhaleTrade.wallet.isnot(None),
+                WhaleTrade.traded_at >= since)
+        .group_by(WhaleTrade.wallet)
+        .order_by(volume.desc())
+        .limit(limit)
+        .all()
+    )
+    addresses = [r[0] for r in rows]
+    tags = {
+        w.address: w.tag
+        for w in session.query(Wallet).filter(Wallet.address.in_(addresses))
+    } if addresses else {}
+    return [
+        {"address": addr, "trades": count, "volume": float(vol),
+         "biggest": float(biggest or 0), "last_traded": last,
+         "tag": tags.get(addr, "")}
+        for addr, count, vol, biggest, last in rows
+    ]
+
+
+def wallet_market_breakdown(session, address: str, limit: int = 15) -> list:
+    """A wallet's whale volume grouped by market, biggest first."""
+    volume = func.coalesce(func.sum(WhaleTrade.amount_usd), 0)
+    rows = (
+        session.query(
+            WhaleTrade.market_title,
+            func.count(WhaleTrade.id),
+            volume,
+            func.max(WhaleTrade.traded_at),
+        )
+        .filter(WhaleTrade.wallet == address.lower())
+        .group_by(WhaleTrade.market_title)
+        .order_by(volume.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {"market": title, "trades": count, "volume": float(vol), "last_traded": last}
+        for title, count, vol, last in rows
+    ]
 
 
 def get_stats(session) -> dict:

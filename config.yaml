@@ -29,6 +29,22 @@ watchlist:
   min_trade_size: 0        # 0 = alert on any size for watched wallets
   addresses: {}            # e.g. "0xabc...": "Sharp Sam"
 
+# Smart money consensus — alert when several distinct whales hit the same
+# side of the same market inside the window. Re-alerts only when the wallet
+# count grows.
+consensus:
+  enabled: true
+  min_wallets: 3
+  window_minutes: 60
+
+# Accumulation — catch wallets splitting orders to stay under min_trade_size.
+# Sums each wallet's sub-threshold trades per market over the window and
+# alerts when the total crosses the threshold (0 = use min_trade_size).
+accumulation:
+  enabled: true
+  window_minutes: 60
+  threshold: 0
+
 telegram:
   # Get a bot token from @BotFather on Telegram
   bot_token: "YOUR_BOT_TOKEN"

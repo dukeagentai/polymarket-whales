@@ -13,6 +13,7 @@ import yaml
 import csv
 import json
 import argparse
+from collections import deque
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from colorama import init, Fore, Style
@@ -69,6 +70,18 @@ def load_config(path: str = "config.yaml") -> dict:
             "min_trade_size": 0,  # alert on any size for watched wallets
             "addresses": {},      # address: label — also manageable in the dashboard
         },
+        "consensus": {
+            # Alert when several distinct whales hit the same side of a market
+            "enabled": True,
+            "min_wallets": 3,
+            "window_minutes": 60,
+        },
+        "accumulation": {
+            # Catch wallets splitting orders to stay under min_trade_size
+            "enabled": True,
+            "window_minutes": 60,
+            "threshold": 0,  # 0 = use min_trade_size
+        },
     }
 
     if os.path.exists(path):
@@ -108,10 +121,12 @@ def load_config(path: str = "config.yaml") -> dict:
 # ─────────────────────────────────────────────
 # Polymarket API
 # ─────────────────────────────────────────────
-def fetch_recent_trades(api_url: str, limit: int = 100) -> list:
-    """Fetch recent trades from Polymarket CLOB API."""
+def fetch_recent_trades(api_url: str, limit: int = 100, offset: int = 0) -> list:
+    """Fetch one page of recent trades (newest first)."""
     url = f"{api_url}/trades"
     params = {"limit": limit}
+    if offset:
+        params["offset"] = offset
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
@@ -137,6 +152,55 @@ def fetch_recent_trades(api_url: str, limit: int = 100) -> list:
         return []
 
 
+def fetch_new_trades(api_url: str, seen_ids: set, max_pages: int = 5,
+                     page_size: int = 100) -> list:
+    """
+    Page through /trades (newest first) until we reach a trade we've already
+    seen, so bursts bigger than one page aren't silently dropped.
+    """
+    trades: list = []
+    for page in range(max_pages):
+        batch = fetch_recent_trades(api_url, limit=page_size,
+                                    offset=page * page_size)
+        if not batch:
+            break
+        trades.extend(batch)
+        if any(trade_unique_id(t) in seen_ids for t in batch):
+            break
+    else:
+        if seen_ids:
+            logger.warning(
+                f"⚠️  Trade burst exceeded {max_pages * page_size} — "
+                "oldest trades this cycle may be missed."
+            )
+    return trades
+
+
+class SeenTrades:
+    """Bounded set of trade ids. Never wholesale-replaced, so one failed
+    fetch can't wipe history and cause a wave of duplicate alerts."""
+
+    def __init__(self, cap: int = 20000):
+        self.cap = cap
+        self._ids: set = set()
+        self._order: deque = deque()
+
+    def __contains__(self, trade_id) -> bool:
+        return trade_id in self._ids
+
+    def add(self, trade_id) -> None:
+        if trade_id in self._ids:
+            return
+        self._ids.add(trade_id)
+        self._order.append(trade_id)
+        while len(self._order) > self.cap:
+            self._ids.discard(self._order.popleft())
+
+    @property
+    def ids(self) -> set:
+        return self._ids
+
+
 def fetch_market_info(condition_id: str) -> dict:
     """
     Fetch market metadata (title, etc.) from Polymarket Gamma API.
@@ -159,6 +223,14 @@ def fetch_market_info(condition_id: str) -> dict:
 
 
 _event_tags_cache: dict = {}
+_CACHE_CAP = 2000  # dicts are insertion-ordered, so eviction below is FIFO
+
+
+def _cache_put(cache: dict, key, value) -> None:
+    """Insert into a module-level cache, evicting oldest entries past the cap."""
+    while len(cache) >= _CACHE_CAP:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
 
 
 def fetch_event_tags(event_slug: str) -> list:
@@ -177,7 +249,7 @@ def fetch_event_tags(event_slug: str) -> list:
             tags = [t.get("label", "") for t in data[0].get("tags", []) if t.get("label")]
     except Exception as e:
         logger.debug(f"Could not fetch event tags for {event_slug}: {e}")
-    _event_tags_cache[event_slug] = tags
+    _cache_put(_event_tags_cache, event_slug, tags)
     return tags
 
 
@@ -408,6 +480,67 @@ def format_watch_message(wallet_line: str, market_title: str, position: str,
     )
 
 
+def format_consensus_message(market_title: str, side: str, wallets: int,
+                             volume: float, window_minutes: int,
+                             bold: str = "*") -> str:
+    """Smart-money consensus alert for Telegram (bold='*') or Discord (bold='**')."""
+    b = bold
+    return (
+        f"🚨 {b}SMART MONEY CONSENSUS{b}\n"
+        f"{'─' * 30}\n"
+        f"{b}Market:{b} {market_title}\n"
+        f"{b}Side:{b}    {side}\n"
+        f"{b}Whales:{b} `{wallets}` distinct wallets in the last {window_minutes} min\n"
+        f"{b}Volume:{b} `${volume:,.0f}` combined\n"
+        f"{'─' * 30}"
+    )
+
+
+def format_consensus_terminal(market_title: str, side: str, wallets: int,
+                              volume: float, window_minutes: int) -> str:
+    lines = [
+        f"\n{Fore.RED}🚨 SMART MONEY CONSENSUS{Style.RESET_ALL}",
+        f"{Fore.WHITE}{DIVIDER}{Style.RESET_ALL}",
+        f"{Fore.WHITE}Market:{Style.RESET_ALL} {market_title}",
+        f"{Fore.WHITE}Side:  {Style.RESET_ALL} {side}",
+        f"{Fore.WHITE}Whales:{Style.RESET_ALL} {Fore.YELLOW}{wallets} distinct wallets in the last {window_minutes} min{Style.RESET_ALL}",
+        f"{Fore.WHITE}Volume:{Style.RESET_ALL} {Fore.YELLOW}${volume:,.0f} combined{Style.RESET_ALL}",
+        f"{Fore.WHITE}{DIVIDER}{Style.RESET_ALL}",
+    ]
+    return "\n".join(lines)
+
+
+def format_accumulation_message(wallet_line: str, market_title: str,
+                                total: float, count: int,
+                                window_minutes: int, bold: str = "*") -> str:
+    """Accumulation alert — a wallet quietly built up size in small clips."""
+    b = bold
+    return (
+        f"🧮 {b}WHALE ACCUMULATION{b}\n"
+        f"{'─' * 30}\n"
+        f"{b}Wallet:{b} `{wallet_line}`\n"
+        f"{b}Market:{b} {market_title}\n"
+        f"{b}Total:{b}  `${total:,.0f}` across {count} trades in {window_minutes} min\n"
+        f"{b}Note:{b}   every trade stayed under the whale threshold\n"
+        f"{'─' * 30}"
+    )
+
+
+def format_accumulation_terminal(wallet_line: str, market_title: str,
+                                 total: float, count: int,
+                                 window_minutes: int) -> str:
+    lines = [
+        f"\n{Fore.BLUE}🧮 WHALE ACCUMULATION{Style.RESET_ALL}",
+        f"{Fore.WHITE}{DIVIDER}{Style.RESET_ALL}",
+        f"{Fore.WHITE}Wallet:{Style.RESET_ALL} {Fore.MAGENTA}{wallet_line}{Style.RESET_ALL}",
+        f"{Fore.WHITE}Market:{Style.RESET_ALL} {market_title}",
+        f"{Fore.WHITE}Total: {Style.RESET_ALL} {Fore.YELLOW}${total:,.0f} across {count} trades in {window_minutes} min{Style.RESET_ALL}",
+        f"{Fore.WHITE}Note:  {Style.RESET_ALL} every trade stayed under the whale threshold",
+        f"{Fore.WHITE}{DIVIDER}{Style.RESET_ALL}",
+    ]
+    return "\n".join(lines)
+
+
 def send_discord_alert(webhook_url: str, message: str) -> bool:
     """Send a message via Discord Webhook API. Returns True on success."""
     if not webhook_url:
@@ -481,7 +614,7 @@ def get_market_details(condition_id: str) -> dict:
         ),
         "category": info.get("category") or "",
     }
-    _market_cache[condition_id] = details
+    _cache_put(_market_cache, condition_id, details)
     return details
 
 
@@ -506,6 +639,16 @@ def run(config: dict, export_path: str = None) -> None:
     custom_wallet_tags = {
         str(k).lower(): v for k, v in (config["wallets"]["tags"] or {}).items()
     }
+
+    consensus_cfg = config["consensus"]
+    consensus_enabled = bool(consensus_cfg.get("enabled", True))
+    consensus_min = int(consensus_cfg.get("min_wallets", 3))
+    consensus_window = int(consensus_cfg.get("window_minutes", 60))
+
+    accum_cfg = config["accumulation"]
+    accum_enabled = bool(accum_cfg.get("enabled", True))
+    accum_window = int(accum_cfg.get("window_minutes", 60))
+    accum_threshold = float(accum_cfg.get("threshold", 0) or 0) or min_size
 
     telegram_enabled = bool(bot_token and chat_id and
                             bot_token != "YOUR_BOT_TOKEN" and
@@ -552,13 +695,22 @@ def run(config: dict, export_path: str = None) -> None:
     if not (telegram_enabled or discord_enabled):
         logger.info("ℹ️  Alerts not configured — terminal-only mode.")
 
-    seen_ids: set = set()
+    seen = SeenTrades()
     last_alert_at: dict = {}  # condition_id -> monotonic time of last alert
+    # Consensus: (condition_id, side) -> (wallet count last alerted at, monotonic ts)
+    consensus_alerted: dict = {}
+    # Accumulation: (wallet, condition_id) -> deque of (monotonic ts, usd);
+    # only sub-threshold trades — a whale-sized clip alerts on its own
+    accum: dict = {}
+    accum_alerted: dict = {}  # (wallet, condition_id) -> monotonic ts
     first_run = True
 
     while True:
         try:
-            trades = fetch_recent_trades(api_url)
+            if first_run:
+                trades = fetch_recent_trades(api_url)  # seed only, no paging
+            else:
+                trades = fetch_new_trades(api_url, seen.ids)
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -575,19 +727,18 @@ def run(config: dict, export_path: str = None) -> None:
             except Exception as e:
                 logger.debug(f"Watchlist load failed: {e}")
 
-        new_seen: set = set()
         whale_count = 0
 
         for trade in trades:
             trade_id = trade_unique_id(trade)
-            new_seen.add(trade_id)
 
-            # On first run, just populate seen_ids (don't alert on old trades)
-            if first_run:
+            # Skip already-seen trades (and mark this one seen)
+            if trade_id in seen:
                 continue
+            seen.add(trade_id)
 
-            # Skip already-seen trades
-            if trade_id in seen_ids:
+            # On first run, just populate the seen set (don't alert on old trades)
+            if first_run:
                 continue
 
             # Calculate USD size, identify the trader, and filter
@@ -596,6 +747,35 @@ def run(config: dict, export_path: str = None) -> None:
             is_watched = bool(wallet_addr) and wallet_addr in watched \
                 and amount_usd >= watch_min
             is_whale = amount_usd >= min_size
+
+            # ── Accumulation: sub-threshold trades summed per wallet+market ──
+            if (accum_enabled and wallet_addr and amount_usd > 0
+                    and not is_whale and not is_watched):
+                cid = (trade.get("market") or trade.get("conditionId")
+                       or trade.get("condition_id", ""))
+                key = (wallet_addr, cid)
+                nowm = time.monotonic()
+                dq = accum.setdefault(key, deque())
+                dq.append((nowm, amount_usd))
+                while dq and nowm - dq[0][0] > accum_window * 60:
+                    dq.popleft()
+                total = sum(a for _, a in dq)
+                last_fired = accum_alerted.get(key, float("-inf"))
+                if total >= accum_threshold and nowm - last_fired > accum_window * 60:
+                    accum_alerted[key] = nowm
+                    acc_title = (trade.get("title") or trade.get("question")
+                                 or (trade.get("slug") or "").replace("-", " ")
+                                 or "Unknown Market")
+                    acc_line = short_wallet(wallet_addr)
+                    print(format_accumulation_terminal(
+                        acc_line, acc_title, total, len(dq), accum_window))
+                    if telegram_enabled:
+                        send_telegram_alert(bot_token, chat_id, format_accumulation_message(
+                            acc_line, acc_title, total, len(dq), accum_window, bold="*"))
+                    if discord_enabled:
+                        send_discord_alert(discord_webhook, format_accumulation_message(
+                            acc_line, acc_title, total, len(dq), accum_window, bold="**"))
+
             if not (is_whale or is_watched):
                 continue
 
@@ -729,6 +909,33 @@ def run(config: dict, export_path: str = None) -> None:
                 except Exception as e:
                     logger.warning(f"Trade persist failed: {e}")
 
+            # ── Smart money consensus: N distinct whales, same market+side ──
+            if consensus_enabled and Session and condition_id and wallet_addr:
+                try:
+                    with Session() as session:
+                        c = db.market_side_whales(session, condition_id, side,
+                                                  consensus_window)
+                    ckey = (condition_id, side)
+                    prev_count, prev_ts = consensus_alerted.get(ckey, (0, 0))
+                    # Reset once the window has fully passed since the last alert
+                    if time.monotonic() - prev_ts > consensus_window * 60:
+                        prev_count = 0
+                    if c["wallets"] >= consensus_min and c["wallets"] > prev_count:
+                        consensus_alerted[ckey] = (c["wallets"], time.monotonic())
+                        print(format_consensus_terminal(
+                            market_title, side, c["wallets"], c["volume"],
+                            consensus_window))
+                        if telegram_enabled:
+                            send_telegram_alert(bot_token, chat_id, format_consensus_message(
+                                market_title, side, c["wallets"], c["volume"],
+                                consensus_window, bold="*"))
+                        if discord_enabled:
+                            send_discord_alert(discord_webhook, format_consensus_message(
+                                market_title, side, c["wallets"], c["volume"],
+                                consensus_window, bold="**"))
+                except Exception as e:
+                    logger.debug(f"Consensus check failed: {e}")
+
             # Export to CSV/JSON if requested
             if export_path:
                 export_trade(export_path, {
@@ -741,6 +948,11 @@ def run(config: dict, export_path: str = None) -> None:
                     "wallet": wallet_addr,
                     "condition_id": condition_id,
                 })
+
+            # Watched wallets already got their own alert above —
+            # don't send a second notification for the same trade
+            if is_watched:
+                continue
 
             # Per-market alert cooldown — trade is still recorded above,
             # we just skip the noisy notifications
@@ -771,8 +983,24 @@ def run(config: dict, export_path: str = None) -> None:
                 if ok:
                     logger.debug("✅ Discord alert sent.")
 
-        # Update seen set (keep it bounded)
-        seen_ids = new_seen
+        # Prune accumulation state so quiet wallet/market pairs don't pile up
+        if accum_enabled:
+            nowm = time.monotonic()
+            stale = [k for k, dq in accum.items()
+                     if not dq or nowm - dq[-1][0] > accum_window * 60]
+            for k in stale:
+                del accum[k]
+            accum_alerted = {k: ts for k, ts in accum_alerted.items()
+                             if nowm - ts <= accum_window * 60}
+
+        # Heartbeat: let the dashboard know the tracker loop is alive
+        if Session:
+            try:
+                with Session() as session:
+                    db.heartbeat(session, interval)
+            except Exception as e:
+                logger.debug(f"Heartbeat failed: {e}")
+
         if not first_run and whale_count == 0:
             logger.info(f"No whale trades found this cycle. Sleeping {interval}s...")
         first_run = False

@@ -10,8 +10,10 @@ Simple Flask UI over the whale database (SQLite locally, Postgres on Railway).
 
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
+import requests
 from flask import Flask, render_template_string, request, redirect
 
 import db
@@ -20,6 +22,43 @@ from db import WhaleTrade, Wallet, WatchedAddress, WatchedTrade
 app = Flask(__name__)
 
 Session = db.init_db()
+
+DATA_API = os.getenv("POLYMARKET_API_URL", "https://data-api.polymarket.com")
+
+# address -> (monotonic_ts, positions); short TTL so page loads don't hammer the API
+_positions_cache: dict = {}
+_POSITIONS_TTL = 120
+_POSITIONS_CACHE_CAP = 500
+
+
+def fetch_positions(address: str, limit: int = 100) -> list:
+    """Open positions for a wallet from the data-api, TTL-cached.
+    Serves stale data if the API errors."""
+    now = time.monotonic()
+    hit = _positions_cache.get(address)
+    if hit and now - hit[0] < _POSITIONS_TTL:
+        return hit[1]
+    try:
+        resp = requests.get(f"{DATA_API}/positions",
+                            params={"user": address, "limit": limit}, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        positions = data if isinstance(data, list) else []
+    except Exception:
+        positions = hit[1] if hit else []
+    while len(_positions_cache) >= _POSITIONS_CACHE_CAP:
+        _positions_cache.pop(next(iter(_positions_cache)))
+    _positions_cache[address] = (now, positions)
+    return positions
+
+
+def positions_summary(positions: list) -> dict:
+    """Collapse a positions list into {value, pnl, count}."""
+    return {
+        "value": sum(p.get("currentValue") or 0 for p in positions),
+        "pnl": sum(p.get("cashPnl") or 0 for p in positions),
+        "count": len(positions),
+    }
 
 CSS = """
   :root {
@@ -92,6 +131,8 @@ CSS = """
            border-radius: 999px; background: var(--yes); color: #fff;
            margin-left: 6px; white-space: nowrap; }
   .btn-danger { background: var(--no); padding: 4px 10px; font-size: 12px; }
+  .warnbar { background: var(--no); color: #fff; border-radius: 10px;
+             padding: 10px 16px; margin-bottom: 20px; font-weight: 600; font-size: 13px; }
   .muted { color: var(--muted); font-size: 12px; }
   form.inline { display: inline; }
   .poslist { margin: 0; padding: 0; list-style: none; }
@@ -111,7 +152,13 @@ def page(title: str, body: str) -> str:
 <style>""" + CSS + """</style>
 </head>
 <body>
-  <nav><a href="/">🐋 Live feed</a><a href="/watchlist">👀 Watchlist</a></nav>
+  <nav><a href="/">🐋 Live feed</a><a href="/watchlist">👀 Watchlist</a><a href="/leaderboard">🏆 Leaderboard</a></nav>
+  {% if tracker and tracker.alive == False %}
+  <div class="warnbar">⚠️ Tracker is down — no poll for
+    {{ (tracker.stale_seconds / 60) | round(0) | int }} min
+    (last: {{ tracker.last_poll_at.strftime("%Y-%m-%d %H:%M UTC") }}).
+    New trades are not being recorded.</div>
+  {% endif %}
 """ + body + """
 </body>
 </html>""")
@@ -175,7 +222,7 @@ TEMPLATE = page("🐋 Polymarket Whales", """
         <td class="{{ 'yes' if t.side == 'YES' else 'no' }}">{{ t.side }}</td>
         <td class="num">${{ "{:,.0f}".format(t.amount_usd) }}</td>
         <td class="num">{{ "%.3f" | format(t.price) }}</td>
-        <td class="addr">{{ t.wallet[:6] ~ "…" ~ t.wallet[-4:] if t.wallet else "—" }}</td>
+        <td class="addr">{% if t.wallet %}<a href="/wallet/{{ t.wallet }}" style="color: inherit">{{ t.wallet[:6] ~ "…" ~ t.wallet[-4:] }}</a>{% else %}—{% endif %}</td>
       </tr>
       {% else %}
       <tr><td colspan="7" class="empty">No whale trades yet — start the tracker: <code>python main.py</code></td></tr>
@@ -196,7 +243,7 @@ TEMPLATE = page("🐋 Polymarket Whales", """
       <tbody>
       {% for w in wallets %}
       <tr>
-        <td class="addr"><a href="?wallet={{ w.address }}" style="color: inherit">{{ w.address[:10] ~ "…" ~ w.address[-6:] }}</a></td>
+        <td class="addr"><a href="/wallet/{{ w.address }}" style="color: inherit">{{ w.address[:10] ~ "…" ~ w.address[-6:] }}</a></td>
         <td class="tag">{{ w.tag or "—" }}</td>
         <td class="num">{{ w.trade_count }}</td>
         <td class="num">${{ "{:,.0f}".format(w.total_usd) }}</td>
@@ -229,16 +276,20 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
     <table>
       <thead><tr>
         <th>Address</th><th>Label</th><th class="num">Trades</th>
-        <th class="num">Volume</th><th>Last trade (UTC)</th><th>Added</th><th></th>
+        <th class="num">Volume</th><th class="num">Open value</th>
+        <th class="num">Unrealized P&L</th><th>Last trade (UTC)</th><th>Added</th><th></th>
       </tr></thead>
       <tbody>
       {% for a in addresses %}
       {% set s = stats.get(a.address, {}) %}
+      {% set p = pnl.get(a.address, {}) %}
       <tr>
-        <td class="addr">{{ a.address }}</td>
+        <td class="addr"><a href="/wallet/{{ a.address }}" style="color: inherit">{{ a.address }}</a></td>
         <td class="tag">{{ a.label or "—" }}</td>
         <td class="num">{{ s.get("trades", 0) }}</td>
         <td class="num">${{ "{:,.0f}".format(s.get("volume", 0)) }}</td>
+        <td class="num">${{ "{:,.0f}".format(p.get("value", 0)) }}</td>
+        <td class="num {{ 'yes' if p.get('pnl', 0) >= 0 else 'no' }}">{{ "{:+,.0f}".format(p.get("pnl", 0)) }}</td>
         <td class="num">{{ s["last_traded"].strftime("%m-%d %H:%M") if s.get("last_traded") else "—" }}</td>
         <td class="num">{{ a.added_at.strftime("%Y-%m-%d") if a.added_at else "—" }}</td>
         <td><form class="inline" method="post" action="/watchlist/remove">
@@ -247,7 +298,7 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
         </form></td>
       </tr>
       {% else %}
-      <tr><td colspan="7" class="empty">No watched addresses yet — paste a wallet above to start tracking it.</td></tr>
+      <tr><td colspan="9" class="empty">No watched addresses yet — paste a wallet above to start tracking it.</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -318,6 +369,146 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
 """)
 
 
+LEADERBOARD_TEMPLATE = page("🏆 Leaderboard — Polymarket Whales", """
+  <h1>🏆 Whale leaderboard</h1>
+  <p class="sub">Top wallets by whale-trade volume · trailing {{ days }} days</p>
+
+  <div class="card">
+    <h2>
+      <a href="?days=7" style="{{ 'font-weight:700' if days == 7 else 'color:var(--muted)' }}">7 days</a> ·
+      <a href="?days=30" style="{{ 'font-weight:700' if days == 30 else 'color:var(--muted)' }}">30 days</a>
+    </h2>
+    <div class="scroll">
+    <table>
+      <thead><tr>
+        <th class="num">#</th><th>Wallet</th><th>Tag</th><th class="num">Trades</th>
+        <th class="num">Volume</th><th class="num">Biggest</th><th>Last active (UTC)</th><th></th>
+      </tr></thead>
+      <tbody>
+      {% for w in board %}
+      <tr>
+        <td class="num">{{ loop.index }}</td>
+        <td class="addr"><a href="/wallet/{{ w.address }}" style="color: inherit">{{ w.address[:10] ~ "…" ~ w.address[-6:] }}</a></td>
+        <td class="tag">{{ w.tag or "—" }}</td>
+        <td class="num">{{ w.trades }}</td>
+        <td class="num">${{ "{:,.0f}".format(w.volume) }}</td>
+        <td class="num">${{ "{:,.0f}".format(w.biggest) }}</td>
+        <td class="num">{{ w.last_traded.strftime("%m-%d %H:%M") if w.last_traded else "—" }}</td>
+        <td>{% if w.address not in watched %}
+          <form class="inline" method="post" action="/watchlist/add">
+            <input type="hidden" name="address" value="{{ w.address }}">
+            <button type="submit" title="Add to watchlist">👀 Watch</button>
+          </form>
+        {% else %}<span class="muted">watching</span>{% endif %}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="empty">No whale trades in this window yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+""")
+
+
+WALLET_TEMPLATE = page("Wallet — Polymarket Whales", """
+  <h1 class="addr" style="font-size:18px">{{ address }}</h1>
+  <p class="sub">
+    {{ tag or "No tag yet" }}
+    {% if watch_label is not none %}· 👀 watched{% if watch_label %} as “{{ watch_label }}”{% endif %}{% endif %}
+  </p>
+
+  {% if watch_label is none %}
+  <form class="filters" method="post" action="/watchlist/add">
+    <input type="hidden" name="address" value="{{ address }}">
+    <input type="text" name="label" placeholder="Label (optional)" size="24">
+    <button type="submit">👀 Add to watchlist</button>
+  </form>
+  {% endif %}
+
+  <div class="tiles">
+    <div class="tile"><div class="label">Whale trades</div><div class="value">{{ "{:,}".format(trade_count) }}</div></div>
+    <div class="tile"><div class="label">Whale volume</div><div class="value">${{ "{:,.0f}".format(total_usd) }}</div></div>
+    <div class="tile"><div class="label">First seen</div><div class="value" style="font-size:16px">{{ first_seen.strftime("%Y-%m-%d") if first_seen else "—" }}</div></div>
+    <div class="tile"><div class="label">Last seen</div><div class="value" style="font-size:16px">{{ last_seen.strftime("%Y-%m-%d %H:%M") if last_seen else "—" }}</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Open positions <span class="hint">live from Polymarket · unrealized P&L</span></h2>
+    <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>Market</th><th>Outcome</th><th class="num">Shares</th>
+        <th class="num">Avg price</th><th class="num">Now</th>
+        <th class="num">Value</th><th class="num">P&L</th>
+      </tr></thead>
+      <tbody>
+      {% for p in positions %}
+      <tr>
+        <td>{{ p.title }}</td>
+        <td class="{{ 'yes' if p.outcome == 'Yes' else ('no' if p.outcome == 'No' else '') }}">{{ p.outcome }}</td>
+        <td class="num">{{ "{:,.0f}".format(p.size or 0) }}</td>
+        <td class="num">{{ "%.3f" | format(p.avgPrice or 0) }}</td>
+        <td class="num">{{ "%.3f" | format(p.curPrice or 0) }}</td>
+        <td class="num">${{ "{:,.0f}".format(p.currentValue or 0) }}</td>
+        <td class="num {{ 'yes' if (p.cashPnl or 0) >= 0 else 'no' }}">{{ "{:+,.0f}".format(p.cashPnl or 0) }} ({{ "{:+,.0f}".format(p.percentPnl or 0) }}%)</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">No open positions.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Top markets <span class="hint">by this wallet's whale volume</span></h2>
+    <div class="scroll">
+    <table>
+      <thead><tr><th>Market</th><th class="num">Trades</th><th class="num">Volume</th><th>Last trade (UTC)</th></tr></thead>
+      <tbody>
+      {% for m in markets %}
+      <tr>
+        <td>{{ m.market }}</td>
+        <td class="num">{{ m.trades }}</td>
+        <td class="num">${{ "{:,.0f}".format(m.volume) }}</td>
+        <td class="num">{{ m.last_traded.strftime("%m-%d %H:%M") if m.last_traded else "—" }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="4" class="empty">No whale trades recorded for this wallet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Recent whale trades</h2>
+    <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>Time (UTC)</th><th>Market</th><th>Side</th>
+        <th class="num">Amount</th><th class="num">Price</th>
+      </tr></thead>
+      <tbody>
+      {% for t in trades %}
+      <tr>
+        <td class="num">{{ t.traded_at.strftime("%m-%d %H:%M") if t.traded_at else "—" }}</td>
+        <td>{{ t.market_title }}</td>
+        <td class="{{ 'yes' if t.side == 'YES' else 'no' }}">{{ t.side }}</td>
+        <td class="num">${{ "{:,.0f}".format(t.amount_usd) }}</td>
+        <td class="num">{{ "%.3f" | format(t.price) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="empty">Nothing yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+""")
+
+
 def hourly_volume(session, hours: int = 24) -> list:
     """Bucket whale volume per hour over the trailing window."""
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -371,6 +562,7 @@ def index():
         )
         stats = db.get_stats(session)
         hourly = hourly_volume(session)
+        tracker = db.tracker_health(session)
 
     hourly_max = max((h["volume"] for h in hourly), default=0)
     return render_template_string(
@@ -382,10 +574,63 @@ def index():
         hourly=hourly,
         hourly_max=hourly_max,
         q=q, category=category, wallet=wallet,
+        tracker=tracker,
     )
 
 
 ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}$")
+
+
+@app.route("/leaderboard")
+def leaderboard():
+    if Session is None:
+        return "Database unavailable — check DATABASE_URL.", 503
+    days = 30 if request.args.get("days") == "30" else 7
+    with Session() as session:
+        board = db.wallet_leaderboard(session, days=days)
+        watched = {a.address for a in db.get_watched_addresses(session)}
+        tracker = db.tracker_health(session)
+    return render_template_string(
+        LEADERBOARD_TEMPLATE, board=board, days=days, watched=watched,
+        tracker=tracker,
+    )
+
+
+@app.route("/wallet/<address>")
+def wallet_page(address):
+    if Session is None:
+        return "Database unavailable — check DATABASE_URL.", 503
+    address = address.strip().lower()
+    if not ADDRESS_RE.fullmatch(address):
+        return "Invalid wallet address.", 404
+
+    with Session() as session:
+        w = session.get(Wallet, address)
+        watch = session.get(WatchedAddress, address)
+        markets = db.wallet_market_breakdown(session, address)
+        trades = (
+            session.query(WhaleTrade)
+            .filter(WhaleTrade.wallet == address)
+            .order_by(WhaleTrade.traded_at.desc())
+            .limit(100)
+            .all()
+        )
+        tracker = db.tracker_health(session)
+
+    return render_template_string(
+        WALLET_TEMPLATE,
+        address=address,
+        tag=w.tag if w else "",
+        trade_count=w.trade_count if w else len(trades),
+        total_usd=w.total_usd if w else sum(t.amount_usd or 0 for t in trades),
+        first_seen=w.first_seen if w else None,
+        last_seen=w.last_seen if w else None,
+        watch_label=(watch.label or "") if watch else None,
+        markets=markets,
+        trades=trades,
+        positions=fetch_positions(address),
+        tracker=tracker,
+    )
 
 
 @app.route("/watchlist")
@@ -397,6 +642,7 @@ def watchlist():
         addresses = db.get_watched_addresses(session)
         stats = db.watched_address_stats(session)
         convergence = db.market_convergence(session)
+        tracker = db.tracker_health(session)
         recent = (
             session.query(WatchedTrade)
             .join(WatchedAddress, WatchedAddress.address == WatchedTrade.address)
@@ -404,6 +650,10 @@ def watchlist():
             .limit(50)
             .all()
         )
+
+    # Live open-position value / unrealized P&L per watched wallet
+    pnl = {a.address: positions_summary(fetch_positions(a.address))
+           for a in addresses}
 
     # Friendly display names: label if set, else shortened address
     labels = {
@@ -423,7 +673,9 @@ def watchlist():
         convergence=convergence,
         recent=recent,
         labels=labels,
+        pnl=pnl,
         error=request.args.get("error", ""),
+        tracker=tracker,
     )
 
 
@@ -452,7 +704,17 @@ def watchlist_remove():
 
 @app.route("/health")
 def health():
-    return {"ok": True}
+    result = {"ok": True, "tracker_alive": None, "tracker_last_poll": None}
+    if Session:
+        try:
+            with Session() as session:
+                t = db.tracker_health(session)
+            result["tracker_alive"] = t["alive"]
+            if t["last_poll_at"]:
+                result["tracker_last_poll"] = t["last_poll_at"].isoformat()
+        except Exception:
+            result["ok"] = False
+    return result
 
 
 if __name__ == "__main__":
