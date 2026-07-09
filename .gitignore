@@ -18,3 +18,9 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local database / exports
+whales.db
+*.sqlite3
+whales.csv
+whales.json

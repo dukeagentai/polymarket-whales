@@ -8,6 +8,27 @@ min_trade_size: 500
 # How often to check for new trades (seconds)
 check_interval: 30
 
+# Only alert on matching markets/categories (empty = everything)
+filters:
+  markets: []       # title keywords or condition IDs, e.g. ["Fed rate", "Trump"]
+  categories: []    # e.g. ["Politics", "Crypto", "Sports"]
+
+# Seconds between alerts for the same market — avoids spam on hot markets.
+# Muted trades are still saved to the database. 0 = no cooldown.
+alert_cooldown: 0
+
+# Recurring whale wallet tracking
+wallets:
+  recurring_threshold: 3   # trades before a wallet gets the 🔁 Recurring tag
+  tags: {}                 # manual tags, e.g. "0xabc...": "Known insider"
+
+# Watchlist — wallets you follow explicitly. Every trade they make is recorded
+# and alerted regardless of min_trade_size. Manage them here or in the
+# dashboard at /watchlist (dashboard changes apply live, no restart needed).
+watchlist:
+  min_trade_size: 0        # 0 = alert on any size for watched wallets
+  addresses: {}            # e.g. "0xabc...": "Sharp Sam"
+
 telegram:
   # Get a bot token from @BotFather on Telegram
   bot_token: "YOUR_BOT_TOKEN"
@@ -15,4 +36,6 @@ telegram:
   chat_id: "YOUR_CHAT_ID"
 
 polymarket:
-  api_url: "https://clob.polymarket.com"
+  # Public Data API — no auth or API key needed, includes wallet addresses.
+  # Override with POLYMARKET_API_URL in .env (e.g. for a relay/proxy).
+  api_url: "https://data-api.polymarket.com"
