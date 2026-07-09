@@ -82,6 +82,8 @@ ALERT_COOLDOWN=300                # seconds between alerts per market (0 = off)
 DATABASE_URL=postgresql://...     # defaults to local SQLite (whales.db)
 ```
 
+Watchlist, consensus, and accumulation alerts live in `config.yaml` (see [Advanced](#️-advanced)) — the watchlist can also be managed live from the dashboard at `/watchlist`, no restart needed.
+
 Or edit `config.yaml` directly. Environment variables take priority.
 
 **Telegram setup (optional):**
@@ -111,6 +113,13 @@ Or edit `config.yaml` directly. Environment variables take priority.
 - ✅ Trade deduplication — no double alerts
 - ✅ Graceful handling of network errors and API timeouts
 - ✅ Zero setup beyond `pip install` — SQLite works out of the box, no Docker needed
+- ✅ Wallet watchlist — follow specific addresses, get alerted on every trade they make regardless of size; add/remove live from the dashboard, no restart
+- ✅ Per-wallet pages — trade history, market breakdown, and live open positions / unrealized P&L (pulled from the data-api)
+- ✅ 7d/30d wallet leaderboard, ranked by whale volume
+- ✅ Smart-money consensus alerts — fires when N distinct whales hit the same side of the same market within a time window
+- ✅ Accumulation alerts — catches wallets splitting one big order into many sub-threshold trades
+- ✅ Tracker heartbeat + `/health` endpoint — monitor whether the polling worker is actually alive (uptime checks, Railway healthchecks)
+- ✅ Leaderboard scout (`scout_leaderboard.py`) — pulls Polymarket's real top-traders leaderboard, vets each wallet's real win rate against resolved markets, and auto-populates the watchlist with the ones that qualify
 
 ---
 
@@ -164,6 +173,59 @@ python dashboard.py        # → http://localhost:8000
 Live stats, hourly whale-volume chart, filterable trade history, and a top-wallets
 leaderboard — reads from the same database the tracker writes to.
 
+Pages:
+- `/` — stats, hourly volume chart, trade history
+- `/leaderboard?days=7|30` — wallets ranked by whale volume
+- `/wallet/<address>` — trade history, market breakdown, live open positions & P&L for one wallet
+- `/watchlist` — add/remove watched wallets, see their recent trades, live P&L, and market convergence (multiple watched wallets on the same side of the same market)
+- `/health` — JSON status for uptime monitors: `{"ok": true, "tracker_alive": true, "tracker_last_poll": "..."}`
+
+**Follow specific wallets (watchlist):**
+Every trade a watched wallet makes is recorded and alerted regardless of `min_trade_size`. Manage from `/watchlist` in the dashboard (changes apply live, no restart) or in `config.yaml`:
+```yaml
+watchlist:
+  min_trade_size: 0        # 0 = alert on any size for watched wallets
+  addresses:
+    "0xabc...": "Sharp Sam"
+```
+
+**Auto-populate the watchlist from Polymarket's leaderboard:**
+```bash
+python scout_leaderboard.py --dry-run                    # scan + report only
+python scout_leaderboard.py                               # scan, vet, and add qualifiers to the watchlist
+python scout_leaderboard.py --order-by VOL --top 100 --keep 30
+```
+Pulls the real `polymarket.com/leaderboard` top traders, then vets each one against
+their actual trade history (trade count, and win rate computed from redeemed vs.
+resolved markets) before adding them to the watchlist — so you're not just watching
+whoever has the highest lifetime volume.
+
+**Smart-money consensus alerts:**
+Fires when several distinct whale wallets hit the same side of the same market within
+a time window — re-alerts only when the wallet count grows further:
+```yaml
+consensus:
+  enabled: true
+  min_wallets: 3
+  window_minutes: 60
+```
+
+**Accumulation alerts:**
+Catches wallets splitting a large order into many trades that individually stay under
+`min_trade_size` — sums each wallet's sub-threshold trades per market over the window
+and alerts once the total crosses the threshold:
+```yaml
+accumulation:
+  enabled: true
+  window_minutes: 60
+  threshold: 0        # 0 = use min_trade_size
+```
+
+**Monitor the tracker itself:**
+The worker writes a heartbeat to the database on every poll cycle. Check
+`GET /health` on the dashboard service for uptime monitors, or the tracker
+status banner shown on `/leaderboard` and `/watchlist`.
+
 **24/7 on a VPS:** Any $5/month VPS works — the script uses <10MB RAM.
 
 ---
@@ -195,9 +257,19 @@ Good first issues:
 - [x] Track and tag recurring whale wallets
 - [x] Alert cooldown per market (avoid spam)
 - [x] Web dashboard (simple Flask UI) + Postgres persistence + Railway deploy
+- [x] Wallet watchlist with live P&L, per-wallet pages, and volume leaderboard
+- [x] Smart-money consensus + accumulation alerts
+- [x] Tracker heartbeat / `/health` endpoint
+- [x] Leaderboard scout — auto-populate the watchlist from Polymarket's real top traders, vetted by win rate
+- [ ] Wallet PnL tracking over time (is a whale's win rate trending up or down, not just a point-in-time number)
 - [ ] Streamlit analytics mode (charts over historical whale data)
 - [ ] WebSocket feed instead of polling
-- [ ] Wallet PnL tracking (did the whale win?)
+- [ ] Scheduled/automated leaderboard scout runs (cron, so the watchlist stays fresh without a manual re-run)
+- [ ] Slippage-aware alerting (surface whether a whale's trade meaningfully moved the price, not just its dollar size)
+- [ ] Multi-wallet correlation across time (same cluster of wallets repeatedly moving together, beyond a single market)
+- [ ] Backtest mode — replay historical trades through the alert rules to tune thresholds before going live
+- [ ] Test suite (no automated tests currently cover the alert/consensus/accumulation logic)
+- [ ] Rate-limit / backoff tuning for the leaderboard scout (currently a flat `--pause` between calls)
 
 Open an issue or send a PR — both welcome.
 
