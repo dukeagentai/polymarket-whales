@@ -9,9 +9,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "8721816606:AAHGpKrz2qNAoXwbguAQlEzYKj1TSkZdA4k")
+BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID    = os.getenv("WHALE_CHANNEL_ID", "-1003518498844")
 GAMMA_API  = "https://gamma-api.polymarket.com"
+
+if not BOT_TOKEN:
+    sys.exit("TELEGRAM_BOT_TOKEN is not set — export it or put it in .env")
 
 def fetch(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "polymarket-whales/1.0"})
