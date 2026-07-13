@@ -851,6 +851,15 @@ def run(config: dict, export_path: str = None) -> None:
                                 amount_usd=amount_usd,
                                 traded_at=traded_at,
                             )
+                            if condition_id:
+                                db.upsert_market(
+                                    session,
+                                    condition_id=condition_id,
+                                    title=base_title,
+                                    slug=trade.get("slug", "") or "",
+                                    event_slug=trade.get("eventSlug", "") or "",
+                                    category=category,
+                                )
                     except Exception as e:
                         logger.warning(f"Watched trade persist failed: {e}")
 
@@ -906,6 +915,15 @@ def run(config: dict, export_path: str = None) -> None:
                             wallet=wallet_addr,
                             traded_at=traded_at,
                         )
+                        if condition_id:
+                            db.upsert_market(
+                                session,
+                                condition_id=condition_id,
+                                title=base_title,
+                                slug=trade.get("slug", "") or "",
+                                event_slug=trade.get("eventSlug", "") or "",
+                                category=category,
+                            )
                 except Exception as e:
                     logger.warning(f"Trade persist failed: {e}")
 

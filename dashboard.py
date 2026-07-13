@@ -211,7 +211,7 @@ TEMPLATE = page("🐋 Polymarket Whales", """
     <table>
       <thead><tr>
         <th>Time (UTC)</th><th>Market</th><th>Category</th><th>Side</th>
-        <th class="num">Amount</th><th class="num">Price</th><th>Wallet</th>
+        <th class="num">Amount</th><th class="num">Price</th><th>Wallet</th><th>Result</th>
       </tr></thead>
       <tbody>
       {% for t in trades %}
@@ -223,9 +223,10 @@ TEMPLATE = page("🐋 Polymarket Whales", """
         <td class="num">${{ "{:,.0f}".format(t.amount_usd) }}</td>
         <td class="num">{{ "%.3f" | format(t.price) }}</td>
         <td class="addr">{% if t.wallet %}<a href="/wallet/{{ t.wallet }}" style="color: inherit">{{ t.wallet[:6] ~ "…" ~ t.wallet[-4:] }}</a>{% else %}—{% endif %}</td>
+        <td>{% if t.result == 'WIN' %}<span class="yes">✅ WIN</span>{% elif t.result == 'LOSS' %}<span class="no">❌ LOSS</span>{% else %}<span class="muted">—</span>{% endif %}</td>
       </tr>
       {% else %}
-      <tr><td colspan="7" class="empty">No whale trades yet — start the tracker: <code>python main.py</code></td></tr>
+      <tr><td colspan="8" class="empty">No whale trades yet — start the tracker: <code>python main.py</code></td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -277,12 +278,14 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
       <thead><tr>
         <th>Address</th><th>Label</th><th class="num">Trades</th>
         <th class="num">Volume</th><th class="num">Open value</th>
-        <th class="num">Unrealized P&L</th><th>Last trade (UTC)</th><th>Added</th><th></th>
+        <th class="num">Unrealized P&L</th><th>Record</th><th class="num">Realized P&L</th>
+        <th>Last trade (UTC)</th><th>Added</th><th></th>
       </tr></thead>
       <tbody>
       {% for a in addresses %}
       {% set s = stats.get(a.address, {}) %}
       {% set p = pnl.get(a.address, {}) %}
+      {% set r = records.get(a.address, {}) %}
       <tr>
         <td class="addr"><a href="/wallet/{{ a.address }}" style="color: inherit">{{ a.address }}</a></td>
         <td class="tag">{{ a.label or "—" }}</td>
@@ -290,6 +293,8 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
         <td class="num">${{ "{:,.0f}".format(s.get("volume", 0)) }}</td>
         <td class="num">${{ "{:,.0f}".format(p.get("value", 0)) }}</td>
         <td class="num {{ 'yes' if p.get('pnl', 0) >= 0 else 'no' }}">{{ "{:+,.0f}".format(p.get("pnl", 0)) }}</td>
+        <td class="tag">{% if r.get("wins", 0) + r.get("losses", 0) > 0 %}{{ r.get("wins", 0) }}W–{{ r.get("losses", 0) }}L ({{ "{:.0%}".format(r["win_rate"]) }}){% else %}—{% endif %}</td>
+        <td class="num {{ 'yes' if r.get('realized_pnl', 0) >= 0 else 'no' }}">{{ "{:+,.0f}".format(r.get("realized_pnl", 0)) }}</td>
         <td class="num">{{ s["last_traded"].strftime("%m-%d %H:%M") if s.get("last_traded") else "—" }}</td>
         <td class="num">{{ a.added_at.strftime("%Y-%m-%d") if a.added_at else "—" }}</td>
         <td><form class="inline" method="post" action="/watchlist/remove">
@@ -298,7 +303,7 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
         </form></td>
       </tr>
       {% else %}
-      <tr><td colspan="9" class="empty">No watched addresses yet — paste a wallet above to start tracking it.</td></tr>
+      <tr><td colspan="11" class="empty">No watched addresses yet — paste a wallet above to start tracking it.</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -347,7 +352,7 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
     <table>
       <thead><tr>
         <th>Time (UTC)</th><th>Wallet</th><th>Market</th><th>Position</th>
-        <th class="num">Amount</th><th class="num">Price</th>
+        <th class="num">Amount</th><th class="num">Price</th><th>Result</th>
       </tr></thead>
       <tbody>
       {% for t in recent %}
@@ -358,9 +363,10 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
         <td><span class="{{ 'yes' if (t.outcome or '').upper() == 'YES' else ('no' if (t.outcome or '').upper() == 'NO' else '') }}">{{ t.outcome }} ({{ t.side }})</span></td>
         <td class="num">${{ "{:,.2f}".format(t.amount_usd) }}</td>
         <td class="num">{{ "%.3f" | format(t.price) }}</td>
+        <td>{% if t.result == 'WIN' %}<span class="yes">✅ WIN</span>{% elif t.result == 'LOSS' %}<span class="no">❌ LOSS</span>{% else %}<span class="muted">—</span>{% endif %}</td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="empty">Nothing yet.</td></tr>
+      <tr><td colspan="7" class="empty">Nothing yet.</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -429,6 +435,8 @@ WALLET_TEMPLATE = page("Wallet — Polymarket Whales", """
   <div class="tiles">
     <div class="tile"><div class="label">Whale trades</div><div class="value">{{ "{:,}".format(trade_count) }}</div></div>
     <div class="tile"><div class="label">Whale volume</div><div class="value">${{ "{:,.0f}".format(total_usd) }}</div></div>
+    <div class="tile"><div class="label">Record</div><div class="value" style="font-size:18px">{% if record.wins + record.losses > 0 %}{{ record.wins }}W–{{ record.losses }}L <span class="muted" style="font-size:13px">({{ "{:.0%}".format(record.win_rate) }})</span>{% else %}—{% endif %}</div></div>
+    <div class="tile"><div class="label">Realized P&L</div><div class="value {{ 'yes' if record.realized_pnl >= 0 else 'no' }}" style="font-size:18px">{{ "{:+,.0f}".format(record.realized_pnl) }}</div></div>
     <div class="tile"><div class="label">First seen</div><div class="value" style="font-size:16px">{{ first_seen.strftime("%Y-%m-%d") if first_seen else "—" }}</div></div>
     <div class="tile"><div class="label">Last seen</div><div class="value" style="font-size:16px">{{ last_seen.strftime("%Y-%m-%d %H:%M") if last_seen else "—" }}</div></div>
   </div>
@@ -488,7 +496,7 @@ WALLET_TEMPLATE = page("Wallet — Polymarket Whales", """
     <table>
       <thead><tr>
         <th>Time (UTC)</th><th>Market</th><th>Side</th>
-        <th class="num">Amount</th><th class="num">Price</th>
+        <th class="num">Amount</th><th class="num">Price</th><th>Result</th>
       </tr></thead>
       <tbody>
       {% for t in trades %}
@@ -498,9 +506,10 @@ WALLET_TEMPLATE = page("Wallet — Polymarket Whales", """
         <td class="{{ 'yes' if t.side == 'YES' else 'no' }}">{{ t.side }}</td>
         <td class="num">${{ "{:,.0f}".format(t.amount_usd) }}</td>
         <td class="num">{{ "%.3f" | format(t.price) }}</td>
+        <td>{% if t.result == 'WIN' %}<span class="yes">✅ WIN</span>{% elif t.result == 'LOSS' %}<span class="no">❌ LOSS</span>{% else %}<span class="muted">—</span>{% endif %}</td>
       </tr>
       {% else %}
-      <tr><td colspan="5" class="empty">Nothing yet.</td></tr>
+      <tr><td colspan="6" class="empty">Nothing yet.</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -615,6 +624,7 @@ def wallet_page(address):
             .limit(100)
             .all()
         )
+        record = db.wallet_record(session, address)
         tracker = db.tracker_health(session)
 
     return render_template_string(
@@ -628,6 +638,7 @@ def wallet_page(address):
         watch_label=(watch.label or "") if watch else None,
         markets=markets,
         trades=trades,
+        record=record,
         positions=fetch_positions(address),
         tracker=tracker,
     )
@@ -655,6 +666,10 @@ def watchlist():
     pnl = {a.address: positions_summary(fetch_positions(a.address))
            for a in addresses}
 
+    # Win/loss record + realized P&L from settled trades, per watched wallet
+    with Session() as session:
+        records = {a.address: db.wallet_record(session, a.address) for a in addresses}
+
     # Friendly display names: label if set, else shortened address
     labels = {
         a.address: (a.label or f"{a.address[:6]}…{a.address[-4:]}")
@@ -674,6 +689,7 @@ def watchlist():
         recent=recent,
         labels=labels,
         pnl=pnl,
+        records=records,
         error=request.args.get("error", ""),
         tracker=tracker,
     )
