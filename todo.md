@@ -1,5 +1,17 @@
 # TODO — Roadmap to make polymarket-whales feature-complete
 
+**Status: Phases 1-4 implemented.** Phase 1 (markets + resolution + settlement),
+Phase 2 (realized PnL + win/loss records), Phase 3 (position sync — fixes the
+watchlist lag), and Phase 4 (market participant pages) are done — see
+`resolve_markets.py`, `sync_positions.py`, `migrate_002_trade_results.py`, and the
+`Market`/`WalletPnlSnapshot`/`WalletPosition` tables + helpers in `db.py`. One
+deviation from the plan worth knowing: Gamma's `/markets` endpoint implicitly
+filters to `closed=false` unless `closed=true` is passed explicitly, so
+`resolve_markets.py` does a two-phase fetch (plain query, then a `closed=true`
+retry for anything the first pass didn't return) — see the comment in
+`run_once()`. Phases 5-6 (tracked/unknown wallet promotion flow, JSON API,
+pagination, retention, tests) are still open.
+
 This is an implementation plan, ordered by priority. Each item says **what to build,
 where, the schema/function signatures to use, and how to verify it**. Follow the
 existing code style (SQLAlchemy models in `db.py`, plain functions, emoji log lines).

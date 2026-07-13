@@ -17,7 +17,7 @@ import requests
 from flask import Flask, render_template_string, request, redirect
 
 import db
-from db import WhaleTrade, Wallet, WatchedAddress, WatchedTrade
+from db import WhaleTrade, Wallet, WatchedAddress, WatchedTrade, Market
 
 app = Flask(__name__)
 
@@ -32,7 +32,12 @@ _POSITIONS_CACHE_CAP = 500
 
 
 def fetch_positions(address: str, limit: int = 100) -> list:
-    """Open positions for a wallet from the data-api, TTL-cached.
+    """Live open positions for a wallet from the data-api, TTL-cached.
+    Fallback path only — used on /wallet/<address> for wallets the
+    sync_positions.py job doesn't cover (unwatched wallets with no synced
+    rows yet). Watched wallets and the /watchlist page read the DB instead
+    (see db.get_wallet_positions / db.positions_summary_db) so page loads
+    don't block on one HTTP call per wallet.
     Serves stale data if the API errors."""
     now = time.monotonic()
     hit = _positions_cache.get(address)
@@ -50,6 +55,20 @@ def fetch_positions(address: str, limit: int = 100) -> list:
         _positions_cache.pop(next(iter(_positions_cache)))
     _positions_cache[address] = (now, positions)
     return positions
+
+
+def _normalize_position(p) -> dict:
+    """Normalize a position to the data-api's camelCase shape, whether it
+    came from a live call (dict) or the synced wallet_positions table
+    (db.WalletPosition row)."""
+    if isinstance(p, dict):
+        return p
+    return {
+        "title": p.title, "outcome": p.outcome, "size": p.size,
+        "avgPrice": p.avg_price, "curPrice": p.cur_price,
+        "currentValue": p.current_value, "cashPnl": p.cash_pnl,
+        "percentPnl": p.percent_pnl, "conditionId": p.condition_id,
+    }
 
 
 def positions_summary(positions: list) -> dict:
@@ -152,7 +171,7 @@ def page(title: str, body: str) -> str:
 <style>""" + CSS + """</style>
 </head>
 <body>
-  <nav><a href="/">🐋 Live feed</a><a href="/watchlist">👀 Watchlist</a><a href="/leaderboard">🏆 Leaderboard</a></nav>
+  <nav><a href="/">🐋 Live feed</a><a href="/watchlist">👀 Watchlist</a><a href="/leaderboard">🏆 Leaderboard</a><a href="/markets">🗂️ Markets</a></nav>
   {% if tracker and tracker.alive == False %}
   <div class="warnbar">⚠️ Tracker is down — no poll for
     {{ (tracker.stale_seconds / 60) | round(0) | int }} min
@@ -217,7 +236,7 @@ TEMPLATE = page("🐋 Polymarket Whales", """
       {% for t in trades %}
       <tr>
         <td class="num">{{ t.traded_at.strftime("%m-%d %H:%M") if t.traded_at else "—" }}</td>
-        <td>{{ t.market_title }}</td>
+        <td>{% if t.condition_id %}<a href="/market/{{ t.condition_id }}" style="color: inherit">{{ t.market_title }}</a>{% else %}{{ t.market_title }}{% endif %}</td>
         <td>{{ t.category or "—" }}</td>
         <td class="{{ 'yes' if t.side == 'YES' else 'no' }}">{{ t.side }}</td>
         <td class="num">${{ "{:,.0f}".format(t.amount_usd) }}</td>
@@ -266,6 +285,7 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
 
   <div class="card">
     <h2>Watched addresses <span class="hint">({{ addresses|length }})</span></h2>
+    <p class="muted">{{ positions_synced_note }}</p>
     <form class="filters" method="post" action="/watchlist/add">
       <input type="text" name="address" placeholder="0x wallet address…" size="46"
              required pattern="0x[0-9a-fA-F]{40}" title="Full 0x wallet address (42 characters)">
@@ -321,7 +341,7 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
       <tbody>
       {% for m in convergence %}
       <tr>
-        <td>{{ m.title }}{% if m.consensus %}<span class="badge">⚡ ALL SAME SIDE</span>{% endif %}</td>
+        <td>{% if m.condition_id %}<a href="/market/{{ m.condition_id }}" style="color: inherit">{{ m.title }}</a>{% else %}{{ m.title }}{% endif %}{% if m.consensus %}<span class="badge">⚡ ALL SAME SIDE</span>{% endif %}</td>
         <td class="num">{{ m.wallet_count }}</td>
         <td>
           <ul class="poslist">
@@ -359,7 +379,7 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
       <tr>
         <td class="num">{{ t.traded_at.strftime("%m-%d %H:%M") if t.traded_at else "—" }}</td>
         <td class="addr">{{ labels.get(t.address, t.address[:6] ~ "…" ~ t.address[-4:]) }}</td>
-        <td>{{ t.market_title }}</td>
+        <td>{% if t.condition_id %}<a href="/market/{{ t.condition_id }}" style="color: inherit">{{ t.market_title }}</a>{% else %}{{ t.market_title }}{% endif %}</td>
         <td><span class="{{ 'yes' if (t.outcome or '').upper() == 'YES' else ('no' if (t.outcome or '').upper() == 'NO' else '') }}">{{ t.outcome }} ({{ t.side }})</span></td>
         <td class="num">${{ "{:,.2f}".format(t.amount_usd) }}</td>
         <td class="num">{{ "%.3f" | format(t.price) }}</td>
@@ -442,7 +462,7 @@ WALLET_TEMPLATE = page("Wallet — Polymarket Whales", """
   </div>
 
   <div class="card">
-    <h2>Open positions <span class="hint">live from Polymarket · unrealized P&L</span></h2>
+    <h2>Open positions <span class="hint">{% if positions_synced_at %}synced {{ positions_synced_at.strftime("%m-%d %H:%M UTC") }}{% else %}live from Polymarket{% endif %} · unrealized P&L</span></h2>
     <div class="scroll">
     <table>
       <thead><tr>
@@ -477,7 +497,7 @@ WALLET_TEMPLATE = page("Wallet — Polymarket Whales", """
       <tbody>
       {% for m in markets %}
       <tr>
-        <td>{{ m.market }}</td>
+        <td>{% if m.condition_id %}<a href="/market/{{ m.condition_id }}" style="color: inherit">{{ m.market }}</a>{% else %}{{ m.market }}{% endif %}</td>
         <td class="num">{{ m.trades }}</td>
         <td class="num">${{ "{:,.0f}".format(m.volume) }}</td>
         <td class="num">{{ m.last_traded.strftime("%m-%d %H:%M") if m.last_traded else "—" }}</td>
@@ -502,7 +522,7 @@ WALLET_TEMPLATE = page("Wallet — Polymarket Whales", """
       {% for t in trades %}
       <tr>
         <td class="num">{{ t.traded_at.strftime("%m-%d %H:%M") if t.traded_at else "—" }}</td>
-        <td>{{ t.market_title }}</td>
+        <td>{% if t.condition_id %}<a href="/market/{{ t.condition_id }}" style="color: inherit">{{ t.market_title }}</a>{% else %}{{ t.market_title }}{% endif %}</td>
         <td class="{{ 'yes' if t.side == 'YES' else 'no' }}">{{ t.side }}</td>
         <td class="num">${{ "{:,.0f}".format(t.amount_usd) }}</td>
         <td class="num">{{ "%.3f" | format(t.price) }}</td>
@@ -510,6 +530,103 @@ WALLET_TEMPLATE = page("Wallet — Polymarket Whales", """
       </tr>
       {% else %}
       <tr><td colspan="6" class="empty">Nothing yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+""")
+
+
+MARKETS_TEMPLATE = page("🗂️ Markets — Polymarket Whales", """
+  <h1>🗂️ Markets</h1>
+  <p class="sub">Every market we've recorded a trade in · open first</p>
+
+  <div class="card">
+    <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>Market</th><th>Category</th><th>Status</th>
+        <th class="num">Watched wallets</th><th class="num">Whale volume</th><th>End date</th>
+      </tr></thead>
+      <tbody>
+      {% for m in markets %}
+      <tr>
+        <td><a href="/market/{{ m.condition_id }}" style="color: inherit">{{ m.title }}</a></td>
+        <td>{{ m.category or "—" }}</td>
+        <td>{% if m.resolved %}<span class="tag">✅ {{ m.winning_outcome }}</span>{% else %}<span class="tag">🟢 Open</span>{% endif %}</td>
+        <td class="num">{{ m.watched_count }}</td>
+        <td class="num">${{ "{:,.0f}".format(m.volume) }}</td>
+        <td class="num">{{ m.end_date.strftime("%Y-%m-%d") if m.end_date else "—" }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">No markets recorded yet — they're populated as the tracker sees trades.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+""")
+
+
+MARKET_TEMPLATE = page("Market — Polymarket Whales", """
+  <h1 style="font-size:18px">{{ market.title or market.condition_id }}</h1>
+  <p class="sub">
+    {{ market.category or "Uncategorized" }}
+    {% if market.resolved %}· <span class="yes">✅ Resolved: {{ market.winning_outcome }}</span>{% else %}· <span class="tag">🟢 Open</span>{% endif %}
+    {% if market.end_date %}· ends {{ market.end_date.strftime("%Y-%m-%d") }}{% endif %}
+  </p>
+
+  <div class="card">
+    <h2>Watched wallets in this market <span class="hint">({{ participants.watched|length }})</span></h2>
+    <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>Wallet</th><th>Label</th><th class="num">Trades</th>
+        <th>Positions</th><th class="num">Total</th><th>Last trade (UTC)</th>
+      </tr></thead>
+      <tbody>
+      {% for p in participants.watched %}
+      <tr>
+        <td class="addr"><a href="/wallet/{{ p.address }}" style="color: inherit">{{ p.address[:10] ~ "…" ~ p.address[-6:] }}</a></td>
+        <td class="tag">{{ p.label_or_tag or "—" }}</td>
+        <td class="num">{{ p.trades }}</td>
+        <td>{% for k, v in p.outcomes.items() %}<div><span class="{{ 'yes' if k.upper().startswith('YES') else ('no' if k.upper().startswith('NO') else '') }}">{{ k }}</span> — ${{ "{:,.0f}".format(v) }}</div>{% endfor %}</td>
+        <td class="num">${{ "{:,.0f}".format(p.volume) }}</td>
+        <td class="num">{{ p.last_traded.strftime("%m-%d %H:%M") if p.last_traded else "—" }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">No watched wallets in this market.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Other wallets <span class="hint">({{ participants.unknown|length }})</span></h2>
+    <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>Wallet</th><th>Tag</th><th class="num">Trades</th>
+        <th>Positions</th><th class="num">Total</th><th>Last trade (UTC)</th><th></th>
+      </tr></thead>
+      <tbody>
+      {% for p in participants.unknown %}
+      <tr>
+        <td class="addr"><a href="/wallet/{{ p.address }}" style="color: inherit">{{ p.address[:10] ~ "…" ~ p.address[-6:] }}</a></td>
+        <td class="tag">{{ p.label_or_tag or "—" }}</td>
+        <td class="num">{{ p.trades }}</td>
+        <td>{% for k, v in p.outcomes.items() %}<div><span class="{{ 'yes' if k.upper().startswith('YES') else ('no' if k.upper().startswith('NO') else '') }}">{{ k }}</span> — ${{ "{:,.0f}".format(v) }}</div>{% endfor %}</td>
+        <td class="num">${{ "{:,.0f}".format(p.volume) }}</td>
+        <td class="num">{{ p.last_traded.strftime("%m-%d %H:%M") if p.last_traded else "—" }}</td>
+        <td><form class="inline" method="post" action="/watchlist/add">
+          <input type="hidden" name="address" value="{{ p.address }}">
+          <button type="submit" title="Add to watchlist">👀 Watch</button>
+        </form></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">No other wallets recorded in this market.</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -588,6 +705,35 @@ def index():
 
 
 ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}$")
+CONDITION_ID_RE = re.compile(r"0x[0-9a-fA-F]+$")
+
+
+@app.route("/markets")
+def markets_page():
+    if Session is None:
+        return "Database unavailable — check DATABASE_URL.", 503
+    with Session() as session:
+        markets = db.markets_index(session)
+        tracker = db.tracker_health(session)
+    return render_template_string(MARKETS_TEMPLATE, markets=markets, tracker=tracker)
+
+
+@app.route("/market/<condition_id>")
+def market_page(condition_id):
+    if Session is None:
+        return "Database unavailable — check DATABASE_URL.", 503
+    condition_id = condition_id.strip().lower()
+    if not CONDITION_ID_RE.fullmatch(condition_id):
+        return "Invalid market condition ID.", 404
+    with Session() as session:
+        market = session.get(Market, condition_id)
+        if market is None:
+            return "Market not found — no trades recorded for this condition ID.", 404
+        participants = db.market_participants(session, condition_id)
+        tracker = db.tracker_health(session)
+    return render_template_string(
+        MARKET_TEMPLATE, market=market, participants=participants, tracker=tracker,
+    )
 
 
 @app.route("/leaderboard")
@@ -625,7 +771,22 @@ def wallet_page(address):
             .all()
         )
         record = db.wallet_record(session, address)
+        db_positions = db.get_wallet_positions(session, address)
         tracker = db.tracker_health(session)
+
+    if db_positions:
+        # Synced by sync_positions.py — no live API call needed.
+        positions = [_normalize_position(p) for p in db_positions]
+        positions_synced_at = db_positions[0].synced_at
+    elif watch is None:
+        # Unwatched wallet the sync job doesn't cover — live call is the
+        # only option, and per-wallet pages are low-traffic enough to afford it.
+        positions = fetch_positions(address)
+        positions_synced_at = None
+    else:
+        # Watched, but sync_positions.py hasn't run yet.
+        positions = []
+        positions_synced_at = None
 
     return render_template_string(
         WALLET_TEMPLATE,
@@ -639,7 +800,8 @@ def wallet_page(address):
         markets=markets,
         trades=trades,
         record=record,
-        positions=fetch_positions(address),
+        positions=positions,
+        positions_synced_at=positions_synced_at,
         tracker=tracker,
     )
 
@@ -661,14 +823,24 @@ def watchlist():
             .limit(50)
             .all()
         )
-
-    # Live open-position value / unrealized P&L per watched wallet
-    pnl = {a.address: positions_summary(fetch_positions(a.address))
-           for a in addresses}
-
-    # Win/loss record + realized P&L from settled trades, per watched wallet
-    with Session() as session:
+        # Position value / unrealized P&L per watched wallet, read from the
+        # table sync_positions.py keeps fresh — a single grouped query
+        # instead of one live API call per wallet (that's what made this
+        # page lag as the watchlist grew).
+        pnl = db.positions_summary_db(session, [a.address for a in addresses])
+        # Win/loss record + realized P&L from settled trades, per watched wallet
         records = {a.address: db.wallet_record(session, a.address) for a in addresses}
+
+    positions_synced_at = max(
+        (v["synced_at"] for v in pnl.values() if v.get("synced_at")), default=None)
+    if positions_synced_at is None:
+        positions_synced_note = "Positions not synced yet — run python sync_positions.py"
+    else:
+        age = positions_synced_at
+        if age.tzinfo is None:
+            age = age.replace(tzinfo=timezone.utc)
+        mins = int((datetime.now(timezone.utc) - age).total_seconds() / 60)
+        positions_synced_note = f"Positions synced {mins} min ago"
 
     # Friendly display names: label if set, else shortened address
     labels = {
@@ -690,6 +862,7 @@ def watchlist():
         labels=labels,
         pnl=pnl,
         records=records,
+        positions_synced_note=positions_synced_note,
         error=request.args.get("error", ""),
         tracker=tracker,
     )

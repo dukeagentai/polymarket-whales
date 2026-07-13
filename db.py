@@ -140,6 +140,26 @@ class WalletPnlSnapshot(Base):
     losses = Column(Integer, default=0)
 
 
+class WalletPosition(Base):
+    """A wallet's open position, synced from the data-api by
+    sync_positions.py. Lets the dashboard read positions from the DB instead
+    of hitting the live API on every page load."""
+    __tablename__ = "wallet_positions"
+
+    id = Column(Integer, primary_key=True)
+    address = Column(String(64), index=True)
+    condition_id = Column(String(128), index=True)
+    title = Column(String(512), default="")
+    outcome = Column(String(128), default="")
+    size = Column(Float, default=0.0)
+    avg_price = Column(Float, default=0.0)
+    cur_price = Column(Float, default=0.0)
+    current_value = Column(Float, default=0.0)
+    cash_pnl = Column(Float, default=0.0)
+    percent_pnl = Column(Float, default=0.0)
+    synced_at = Column(DateTime, index=True)
+
+
 def get_db_url() -> str:
     url = os.getenv("DATABASE_URL", "") or DEFAULT_DB_URL
     # Railway/Heroku hand out postgres:// URLs; SQLAlchemy wants postgresql://
@@ -414,6 +434,7 @@ def market_convergence(session, limit_trades: int = 2000) -> list:
         key = t.condition_id or t.market_title
         m = markets.setdefault(key, {
             "title": t.market_title,
+            "condition_id": t.condition_id or "",
             "wallets": set(),
             "positions": {},   # (outcome, side) -> {wallets, total}
             "total": 0.0,
@@ -438,6 +459,7 @@ def market_convergence(session, limit_trades: int = 2000) -> list:
         positions.sort(key=lambda p: -p["total"])
         result.append({
             "title": m["title"],
+            "condition_id": m["condition_id"],
             "wallet_count": len(m["wallets"]),
             "wallets": sorted(m["wallets"]),
             "positions": positions,
@@ -514,19 +536,21 @@ def wallet_market_breakdown(session, address: str, limit: int = 15) -> list:
     rows = (
         session.query(
             WhaleTrade.market_title,
+            WhaleTrade.condition_id,
             func.count(WhaleTrade.id),
             volume,
             func.max(WhaleTrade.traded_at),
         )
         .filter(WhaleTrade.wallet == address.lower())
-        .group_by(WhaleTrade.market_title)
+        .group_by(WhaleTrade.market_title, WhaleTrade.condition_id)
         .order_by(volume.desc())
         .limit(limit)
         .all()
     )
     return [
-        {"market": title, "trades": count, "volume": float(vol), "last_traded": last}
-        for title, count, vol, last in rows
+        {"market": title, "condition_id": cid or "", "trades": count,
+         "volume": float(vol), "last_traded": last}
+        for title, cid, count, vol, last in rows
     ]
 
 
@@ -640,6 +664,67 @@ def pnl_snapshot_history(session, address: str, limit: int = 60) -> list:
     return list(reversed(rows))
 
 
+def replace_wallet_positions(session, address: str, positions: list) -> int:
+    """Replace a wallet's synced positions wholesale with a fresh pull from
+    the data-api. `positions` is the raw list of dicts from GET /positions.
+    Returns the number of positions stored."""
+    address = address.lower()
+    now = datetime.now(timezone.utc)
+    session.query(WalletPosition).filter(WalletPosition.address == address).delete(
+        synchronize_session=False)
+    for p in positions:
+        session.add(WalletPosition(
+            address=address,
+            condition_id=p.get("conditionId") or "",
+            title=p.get("title") or "",
+            outcome=p.get("outcome") or "",
+            size=float(p.get("size") or 0),
+            avg_price=float(p.get("avgPrice") or 0),
+            cur_price=float(p.get("curPrice") or 0),
+            current_value=float(p.get("currentValue") or 0),
+            cash_pnl=float(p.get("cashPnl") or 0),
+            percent_pnl=float(p.get("percentPnl") or 0),
+            synced_at=now,
+        ))
+    session.commit()
+    return len(positions)
+
+
+def get_wallet_positions(session, address: str) -> list:
+    """A wallet's synced open positions, biggest value first."""
+    return (
+        session.query(WalletPosition)
+        .filter(WalletPosition.address == address.lower())
+        .order_by(WalletPosition.current_value.desc())
+        .all()
+    )
+
+
+def positions_summary_db(session, addresses: list) -> dict:
+    """Per-address {value, pnl, count, synced_at} from the synced positions
+    table — no live API calls, so this is safe to call on every page load."""
+    if not addresses:
+        return {}
+    addresses = [a.lower() for a in addresses]
+    rows = (
+        session.query(
+            WalletPosition.address,
+            func.coalesce(func.sum(WalletPosition.current_value), 0),
+            func.coalesce(func.sum(WalletPosition.cash_pnl), 0),
+            func.count(WalletPosition.id),
+            func.max(WalletPosition.synced_at),
+        )
+        .filter(WalletPosition.address.in_(addresses))
+        .group_by(WalletPosition.address)
+        .all()
+    )
+    return {
+        addr: {"value": float(value), "pnl": float(pnl), "count": count,
+               "synced_at": synced_at}
+        for addr, value, pnl, count, synced_at in rows
+    }
+
+
 def get_stats(session) -> dict:
     """Aggregate stats for the dashboard."""
     total_trades = session.query(func.count(WhaleTrade.id)).scalar() or 0
@@ -652,3 +737,108 @@ def get_stats(session) -> dict:
         "unique_wallets": unique_wallets,
         "biggest_trade": float(biggest),
     }
+
+
+def market_participants(session, condition_id: str) -> dict:
+    """Everyone we've seen trade this market, split into wallets we're
+    explicitly watching vs. everyone else ("unknown" — just whales the feed
+    happened to pick up). Returns {"watched": [...], "unknown": [...]},
+    each entry {address, label_or_tag, trades, volume, outcomes, last_traded}
+    where outcomes maps a "OUTCOME (SIDE)" string to USD wagered on it.
+    """
+    watched_addrs = {
+        a.address: a.label
+        for a in session.query(WatchedAddress).all()
+    }
+    tags = {w.address: w.tag for w in session.query(Wallet).all()}
+
+    per_wallet: dict = {}
+    seen_ids: set = set()  # a watched wallet's whale-sized trade lands in
+                           # both tables under the same trade_id — dedupe
+
+    def _bucket(address: str):
+        return per_wallet.setdefault(address, {
+            "address": address, "trades": 0, "volume": 0.0,
+            "outcomes": {}, "last_traded": None,
+        })
+
+    def _add(address, trade_id, amount_usd, key, traded_at):
+        if trade_id in seen_ids:
+            return
+        seen_ids.add(trade_id)
+        b = _bucket(address)
+        b["trades"] += 1
+        b["volume"] += amount_usd or 0
+        b["outcomes"][key] = b["outcomes"].get(key, 0.0) + (amount_usd or 0)
+        if traded_at and (b["last_traded"] is None or traded_at > b["last_traded"]):
+            b["last_traded"] = traded_at
+
+    # Watched trades first — richer (outcome, side) detail than whale_trades.
+    watched_rows = (
+        session.query(WatchedTrade)
+        .filter(WatchedTrade.condition_id == condition_id)
+        .all()
+    )
+    for t in watched_rows:
+        _add(t.address, t.trade_id, t.amount_usd,
+            f"{t.outcome or '?'} ({t.side or '?'})", t.traded_at)
+
+    whale_rows = (
+        session.query(WhaleTrade)
+        .filter(WhaleTrade.condition_id == condition_id,
+                WhaleTrade.wallet != "", WhaleTrade.wallet.isnot(None))
+        .all()
+    )
+    for t in whale_rows:
+        _add(t.wallet, t.trade_id, t.amount_usd, t.side or "?", t.traded_at)
+
+    watched, unknown = [], []
+    for address, entry in per_wallet.items():
+        if address in watched_addrs:
+            entry["label_or_tag"] = watched_addrs[address] or ""
+            watched.append(entry)
+        else:
+            entry["label_or_tag"] = tags.get(address, "") or ""
+            unknown.append(entry)
+
+    watched.sort(key=lambda e: -e["volume"])
+    unknown.sort(key=lambda e: -e["volume"])
+    return {"watched": watched, "unknown": unknown}
+
+
+def markets_index(session, limit: int = 200) -> list:
+    """Markets we've recorded trades in, open first then most recently
+    checked. `volume` is whale-trade volume only (same number counted
+    everywhere else on the dashboard, not deduped against watched_trades);
+    `watched_count` is every distinct watched address seen in the market at
+    any trade size, from watched_trades."""
+    volume_by_market = dict(
+        session.query(WhaleTrade.condition_id,
+                     func.coalesce(func.sum(WhaleTrade.amount_usd), 0))
+        .filter(WhaleTrade.condition_id != "", WhaleTrade.condition_id.isnot(None))
+        .group_by(WhaleTrade.condition_id)
+        .all()
+    )
+    watched_counts = dict(
+        session.query(WatchedTrade.condition_id,
+                     func.count(func.distinct(WatchedTrade.address)))
+        .filter(WatchedTrade.condition_id != "", WatchedTrade.condition_id.isnot(None))
+        .group_by(WatchedTrade.condition_id)
+        .all()
+    )
+    markets = (
+        session.query(Market)
+        .order_by(Market.resolved.asc(), Market.last_checked.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "condition_id": m.condition_id, "title": m.title or m.condition_id,
+            "category": m.category, "resolved": bool(m.resolved),
+            "winning_outcome": m.winning_outcome, "end_date": m.end_date,
+            "volume": float(volume_by_market.get(m.condition_id, 0)),
+            "watched_count": watched_counts.get(m.condition_id, 0),
+        }
+        for m in markets
+    ]
