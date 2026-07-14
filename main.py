@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from colorama import init, Fore, Style
 
 import db
+from notify import send_telegram_alert, send_discord_alert
 
 # Initialize colorama for cross-platform colored output
 init(autoreset=True)
@@ -62,6 +63,7 @@ def load_config(path: str = "config.yaml") -> dict:
             "categories": [],   # e.g. Politics, Crypto, Sports — empty = all
         },
         "alert_cooldown": 0,    # seconds between alerts per market (0 = off)
+        "retention_days": 0,    # prune resolved-market whale_trades older than this (0 = keep forever)
         "wallets": {
             "recurring_threshold": 3,  # trades before a wallet is tagged recurring
             "tags": {},                # address: custom tag overrides
@@ -114,6 +116,8 @@ def load_config(path: str = "config.yaml") -> dict:
         ]
     if os.getenv("ALERT_COOLDOWN"):
         config["alert_cooldown"] = int(os.getenv("ALERT_COOLDOWN"))
+    if os.getenv("RETENTION_DAYS"):
+        config["retention_days"] = int(os.getenv("RETENTION_DAYS"))
 
     return config
 
@@ -392,31 +396,6 @@ def format_telegram_message(market_title: str, side: str, amount_usd: float,
 # ─────────────────────────────────────────────
 # Telegram sender
 # ─────────────────────────────────────────────
-def send_telegram_alert(bot_token: str, chat_id: str, message: str) -> bool:
-    """Send a message via Telegram Bot API. Returns True on success."""
-    if not bot_token or not chat_id:
-        logger.debug("Telegram not configured — skipping alert.")
-        return False
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        return True
-    except requests.exceptions.HTTPError as e:
-        logger.warning(f"Telegram HTTP error: {e} — response: {resp.text[:200]}")
-        return False
-    except Exception as e:
-        logger.warning(f"Failed to send Telegram alert: {e}")
-        return False
-
-
 def format_discord_message(market_title: str, side: str, amount_usd: float,
                             price: float, timestamp: str,
                             wallet_line: str = "") -> str:
@@ -541,29 +520,6 @@ def format_accumulation_terminal(wallet_line: str, market_title: str,
     return "\n".join(lines)
 
 
-def send_discord_alert(webhook_url: str, message: str) -> bool:
-    """Send a message via Discord Webhook API. Returns True on success."""
-    if not webhook_url:
-        logger.debug("Discord not configured — skipping alert.")
-        return False
-
-    payload = {
-        "content": message,
-    }
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=10)
-        resp.raise_for_status()
-        return True
-    except requests.exceptions.HTTPError as e:
-        logger.warning(f"Discord HTTP error: {e}")
-        return False
-    except Exception as e:
-        logger.warning(f"Failed to send Discord alert: {e}")
-        return False
-
-
-
-
 def export_trade(file_path: str, trade_data: dict) -> None:
     """Export trade data to a CSV or JSON file."""
     if not file_path:
@@ -635,6 +591,7 @@ def run(config: dict, export_path: str = None) -> None:
     market_filters = list(config["filters"]["markets"] or [])
     category_filters = list(config["filters"]["categories"] or [])
     cooldown = int(config["alert_cooldown"] or 0)
+    retention_days = int(config["retention_days"] or 0)
     recurring_threshold = int(config["wallets"]["recurring_threshold"] or 0)
     custom_wallet_tags = {
         str(k).lower(): v for k, v in (config["wallets"]["tags"] or {}).items()
@@ -696,6 +653,7 @@ def run(config: dict, export_path: str = None) -> None:
         logger.info("ℹ️  Alerts not configured — terminal-only mode.")
 
     seen = SeenTrades()
+    last_prune_at = None  # monotonic ts of last retention prune; None = not run yet
     last_alert_at: dict = {}  # condition_id -> monotonic time of last alert
     # Consensus: (condition_id, side) -> (wallet count last alerted at, monotonic ts)
     consensus_alerted: dict = {}
@@ -1018,6 +976,21 @@ def run(config: dict, export_path: str = None) -> None:
                     db.heartbeat(session, interval)
             except Exception as e:
                 logger.debug(f"Heartbeat failed: {e}")
+
+        # Retention: prune resolved-market whale_trades past the cutoff —
+        # once on startup, then once a day. watched_trades are never pruned.
+        if retention_days and Session:
+            nowm = time.monotonic()
+            if last_prune_at is None or nowm - last_prune_at >= 86400:
+                try:
+                    with Session() as session:
+                        deleted = db.prune_old_trades(session, retention_days)
+                    if deleted:
+                        logger.info(f"🧹 Pruned {deleted} whale trade(s) older than "
+                                   f"{retention_days}d from resolved markets.")
+                except Exception as e:
+                    logger.debug(f"Retention prune failed: {e}")
+                last_prune_at = nowm
 
         if not first_run and whale_count == 0:
             logger.info(f"No whale trades found this cycle. Sleeping {interval}s...")

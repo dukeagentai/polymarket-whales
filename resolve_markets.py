@@ -19,15 +19,19 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
 import requests
 from colorama import init, Fore, Style
+from dotenv import load_dotenv
 
 import db
+from notify import send_telegram_alert, send_discord_alert
 
 init(autoreset=True)
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S")
@@ -36,6 +40,31 @@ logger = logging.getLogger(__name__)
 GAMMA_API = "https://gamma-api.polymarket.com"
 CHUNK_SIZE = 20
 RESOLVED_PRICE_THRESHOLD = 0.99
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
+
+def short_wallet(address: str) -> str:
+    """0x1234567890abcdef... → 0x1234…cdef"""
+    if len(address) > 12:
+        return f"{address[:6]}…{address[-4:]}"
+    return address
+
+
+def format_resolution_message(title: str, winning_outcome: str, wallets: list,
+                              bold: str = "*") -> str:
+    """Alert body for a resolved market with watched-wallet activity —
+    one line per watched wallet involved, its record and PnL in this market."""
+    b = bold
+    lines = [f"🏁 {b}MARKET RESOLVED{b}", "─" * 30,
+             f"{b}Market:{b} {title}", f"{b}Result:{b} {winning_outcome}", "─" * 30]
+    for w in sorted(wallets, key=lambda w: -abs(w["pnl"])):
+        name = w["label"] or short_wallet(w["address"])
+        sign = "+" if w["pnl"] >= 0 else ""
+        lines.append(f"{name}: {w['wins']}W-{w['losses']}L  {sign}${w['pnl']:,.0f}")
+    return "\n".join(lines)
 
 
 def _get_json(url: str, params: dict, timeout: int = 20, retries: int = 2):
@@ -175,6 +204,16 @@ def run_once(limit: int, pause: float) -> dict:
                       f"→ {Fore.YELLOW}{winning_outcome}{Style.RESET_ALL} "
                       f"— settled {counts['whale_trades']} whale trade(s), "
                       f"{counts['watched_trades']} watched trade(s)")
+
+                if counts["watched_trades"] > 0:
+                    wallets = db.market_watched_settlement(session, cid)
+                    title = market.title or cid
+                    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                        send_telegram_alert(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+                            format_resolution_message(title, winning_outcome, wallets, bold="*"))
+                    if DISCORD_WEBHOOK_URL:
+                        send_discord_alert(DISCORD_WEBHOOK_URL,
+                            format_resolution_message(title, winning_outcome, wallets, bold="**"))
 
     logger.info(f"Pass complete — {resolved_count} market(s) resolved this round.")
     return {"checked": len(condition_ids), "resolved": resolved_count}

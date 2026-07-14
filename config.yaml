@@ -17,6 +17,11 @@ filters:
 # Muted trades are still saved to the database. 0 = no cooldown.
 alert_cooldown: 0
 
+# Delete whale_trades older than this many days, but only once their market
+# has resolved (open markets are always kept regardless of age).
+# watched_trades are never pruned. 0 = keep forever.
+retention_days: 0
+
 # Recurring whale wallet tracking
 wallets:
   recurring_threshold: 3   # trades before a wallet gets the 🔁 Recurring tag

@@ -79,6 +79,7 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 MARKET_FILTER=Fed rate,Trump      # comma-separated title keywords or condition IDs
 CATEGORY_FILTER=Politics,Crypto   # comma-separated categories
 ALERT_COOLDOWN=300                # seconds between alerts per market (0 = off)
+RETENTION_DAYS=0                  # prune resolved-market whale_trades older than this (0 = keep forever)
 DATABASE_URL=postgresql://...     # defaults to local SQLite (whales.db)
 ```
 
@@ -119,7 +120,13 @@ Or edit `config.yaml` directly. Environment variables take priority.
 - ✅ Smart-money consensus alerts — fires when N distinct whales hit the same side of the same market within a time window
 - ✅ Accumulation alerts — catches wallets splitting one big order into many sub-threshold trades
 - ✅ Tracker heartbeat + `/health` endpoint — monitor whether the polling worker is actually alive (uptime checks, Railway healthchecks)
-- ✅ Leaderboard scout (`scout_leaderboard.py`) — pulls Polymarket's real top-traders leaderboard, vets each wallet's real win rate against resolved markets, and auto-populates the watchlist with the ones that qualify
+- ✅ Leaderboard scout (`scout_leaderboard.py`) — pulls Polymarket's real top-traders leaderboard, vets each wallet's real win rate against resolved markets, and auto-populates the watchlist with the ones that qualify (capped watchlist size, safe to run on a schedule)
+- ✅ Market resolution tracking (`resolve_markets.py`) — polls for markets that have resolved and settles every recorded trade WIN or LOSS
+- ✅ Realized win/loss records + P&L — Record and Realized P&L columns on `/wallet/<address>`, `/watchlist`, and `/leaderboard`, computed from settled trades
+- ✅ Position sync (`sync_positions.py`) — keeps watched-wallet P&L in the database instead of hitting the live API on every `/watchlist` page load
+- ✅ Market pages (`/markets`, `/market/<condition_id>`) — see who's in a market, split into watched wallets vs. unknown ones, with resolution status
+- ✅ "Unknown wallets worth a look" — top feed wallets not yet on the watchlist, one click to start watching
+- ✅ Paginated trade history on the live feed (`?page=N`)
 
 ---
 
@@ -194,11 +201,36 @@ watchlist:
 python scout_leaderboard.py --dry-run                    # scan + report only
 python scout_leaderboard.py                               # scan, vet, and add qualifiers to the watchlist
 python scout_leaderboard.py --order-by VOL --top 100 --keep 30
+python scout_leaderboard.py --max-keep-total 100          # cap on watchlist size (default) — new
+                                                           # qualifiers stop being added once hit;
+                                                           # already-watched wallets still get their
+                                                           # label refreshed
 ```
 Pulls the real `polymarket.com/leaderboard` top traders, then vets each one against
 their actual trade history (trade count, and win rate computed from redeemed vs.
 resolved markets) before adding them to the watchlist — so you're not just watching
-whoever has the highest lifetime volume.
+whoever has the highest lifetime volume. Safe to run on a schedule (e.g. weekly via
+Railway cron — see [Deploy to Railway](#-deploy-to-railway)) to keep the watchlist
+fresh without growing it forever.
+
+**Market resolution + settled win/loss records:**
+```bash
+python resolve_markets.py             # one pass: check unresolved markets, settle trades
+python resolve_markets.py --loop 900  # run forever, one pass every 15 min
+```
+Polls the Gamma API for markets we've recorded trades in, and once one resolves,
+marks every recorded trade in it WIN or LOSS. Powers the Record / Realized P&L
+columns on `/wallet/<address>`, `/watchlist`, and `/leaderboard`, and the
+resolution badge on `/market/<condition_id>`.
+
+**Sync watched-wallet positions into the database:**
+```bash
+python sync_positions.py             # one pass: sync every watched wallet
+python sync_positions.py --loop 300  # run forever, one pass every 5 min
+```
+Pulls each watched wallet's open positions from the data-api into the
+`wallet_positions` table, so `/watchlist` reads one grouped DB query instead of
+making a live API call per watched wallet on every page load.
 
 **Smart-money consensus alerts:**
 Fires when several distinct whale wallets hit the same side of the same market within
@@ -244,6 +276,19 @@ railway init && railway add --database postgres && railway up
 ```
 
 Both services share the Postgres database: the worker writes whale trades, the dashboard reads them.
+
+**Optional background jobs** — each is a small standalone script, so pick whichever
+deployment fits: a long-running service (`--loop`), or a scheduled [Railway cron
+job](https://docs.railway.com/reference/cron-jobs) that runs once and exits.
+
+| Script | Purpose | Suggested cadence |
+|---|---|---|
+| `python resolve_markets.py` | Settle trades once their market resolves | every 15 min (`--loop 900`) or cron |
+| `python sync_positions.py` | Keep `/watchlist` P&L reads off the live API | every 5 min (`--loop 300`) or cron |
+| `python scout_leaderboard.py` | Refresh the watchlist from the real leaderboard | weekly cron |
+
+All three read `DATABASE_URL` the same way the tracker and dashboard do — no extra
+config beyond referencing the shared Postgres variable.
 
 ---
 

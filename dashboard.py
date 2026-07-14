@@ -14,7 +14,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
-from flask import Flask, render_template_string, request, redirect
+from flask import Flask, render_template_string, request, redirect, jsonify
 
 import db
 from db import WhaleTrade, Wallet, WatchedAddress, WatchedTrade, Market
@@ -156,6 +156,8 @@ CSS = """
   form.inline { display: inline; }
   .poslist { margin: 0; padding: 0; list-style: none; }
   .poslist li { margin: 2px 0; }
+  .pager { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 13px; }
+  .pager a { color: var(--series-1); text-decoration: none; font-weight: 600; }
 """
 
 
@@ -241,7 +243,7 @@ TEMPLATE = page("🐋 Polymarket Whales", """
         <td class="{{ 'yes' if t.side == 'YES' else 'no' }}">{{ t.side }}</td>
         <td class="num">${{ "{:,.0f}".format(t.amount_usd) }}</td>
         <td class="num">{{ "%.3f" | format(t.price) }}</td>
-        <td class="addr">{% if t.wallet %}<a href="/wallet/{{ t.wallet }}" style="color: inherit">{{ t.wallet[:6] ~ "…" ~ t.wallet[-4:] }}</a>{% else %}—{% endif %}</td>
+        <td class="addr">{% if t.wallet %}<a href="/wallet/{{ t.wallet }}" style="color: inherit">{% if t.wallet in watched_set %}👀 {% endif %}{{ t.wallet[:6] ~ "…" ~ t.wallet[-4:] }}</a>{% else %}—{% endif %}</td>
         <td>{% if t.result == 'WIN' %}<span class="yes">✅ WIN</span>{% elif t.result == 'LOSS' %}<span class="no">❌ LOSS</span>{% else %}<span class="muted">—</span>{% endif %}</td>
       </tr>
       {% else %}
@@ -249,6 +251,11 @@ TEMPLATE = page("🐋 Polymarket Whales", """
       {% endfor %}
       </tbody>
     </table>
+    </div>
+    <div class="pager">
+      {% if page > 1 %}<a href="?{{ pager_qs }}page={{ page - 1 }}">← Newer</a>{% else %}<span class="muted">← Newer</span>{% endif %}
+      <span class="muted">page {{ page }}{% if total_pages %} of {{ total_pages }}{% endif %}</span>
+      {% if has_next %}<a href="?{{ pager_qs }}page={{ page + 1 }}">Older →</a>{% else %}<span class="muted">Older →</span>{% endif %}
     </div>
   </div>
 
@@ -258,19 +265,23 @@ TEMPLATE = page("🐋 Polymarket Whales", """
     <table>
       <thead><tr>
         <th>Wallet</th><th>Tag</th><th class="num">Trades</th>
-        <th class="num">Total volume</th><th>Last seen (UTC)</th>
+        <th class="num">Total volume</th><th>Record</th><th class="num">Realized P&L</th>
+        <th>Last seen (UTC)</th>
       </tr></thead>
       <tbody>
       {% for w in wallets %}
+      {% set r = wallet_records.get(w.address, {}) %}
       <tr>
-        <td class="addr"><a href="/wallet/{{ w.address }}" style="color: inherit">{{ w.address[:10] ~ "…" ~ w.address[-6:] }}</a></td>
+        <td class="addr"><a href="/wallet/{{ w.address }}" style="color: inherit">{% if w.address in watched_set %}👀 {% endif %}{{ w.address[:10] ~ "…" ~ w.address[-6:] }}</a></td>
         <td class="tag">{{ w.tag or "—" }}</td>
         <td class="num">{{ w.trade_count }}</td>
         <td class="num">${{ "{:,.0f}".format(w.total_usd) }}</td>
+        <td class="tag">{% if r.get("wins", 0) + r.get("losses", 0) > 0 %}{{ r.get("wins", 0) }}W–{{ r.get("losses", 0) }}L ({{ "{:.0%}".format(r["win_rate"]) }}){% else %}—{% endif %}</td>
+        <td class="num {{ 'yes' if r.get('realized_pnl', 0) >= 0 else 'no' }}">{{ "{:+,.0f}".format(r.get("realized_pnl", 0)) }}</td>
         <td class="num">{{ w.last_seen.strftime("%m-%d %H:%M") if w.last_seen else "—" }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="5" class="empty">No wallets tracked yet.</td></tr>
+      <tr><td colspan="7" class="empty">No wallets tracked yet.</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -367,6 +378,35 @@ WATCHLIST_TEMPLATE = page("👀 Watchlist — Polymarket Whales", """
   </div>
 
   <div class="card">
+    <h2>Unknown wallets worth a look <span class="hint">— top feed wallets not on your watchlist</span></h2>
+    <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>Wallet</th><th>Tag</th><th class="num">Whale trades</th>
+        <th class="num">Whale volume</th><th>Last seen (UTC)</th><th></th>
+      </tr></thead>
+      <tbody>
+      {% for w in unwatched %}
+      <tr>
+        <td class="addr"><a href="/wallet/{{ w.address }}" style="color: inherit">{{ w.address[:10] ~ "…" ~ w.address[-6:] }}</a></td>
+        <td class="tag">{{ w.tag or "—" }}</td>
+        <td class="num">{{ w.trade_count }}</td>
+        <td class="num">${{ "{:,.0f}".format(w.total_usd) }}</td>
+        <td class="num">{{ w.last_seen.strftime("%m-%d %H:%M") if w.last_seen else "—" }}</td>
+        <td><form class="inline" method="post" action="/watchlist/add">
+          <input type="hidden" name="address" value="{{ w.address }}">
+          <button type="submit" title="Add to watchlist">👀 Watch</button>
+        </form></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">No unwatched wallets in the feed yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Recent trades by watched wallets</h2>
     <div class="scroll">
     <table>
@@ -408,10 +448,12 @@ LEADERBOARD_TEMPLATE = page("🏆 Leaderboard — Polymarket Whales", """
     <table>
       <thead><tr>
         <th class="num">#</th><th>Wallet</th><th>Tag</th><th class="num">Trades</th>
-        <th class="num">Volume</th><th class="num">Biggest</th><th>Last active (UTC)</th><th></th>
+        <th class="num">Volume</th><th class="num">Biggest</th><th>Record</th>
+        <th class="num">Realized P&L</th><th>Last active (UTC)</th><th></th>
       </tr></thead>
       <tbody>
       {% for w in board %}
+      {% set r = records.get(w.address, {}) %}
       <tr>
         <td class="num">{{ loop.index }}</td>
         <td class="addr"><a href="/wallet/{{ w.address }}" style="color: inherit">{{ w.address[:10] ~ "…" ~ w.address[-6:] }}</a></td>
@@ -419,6 +461,8 @@ LEADERBOARD_TEMPLATE = page("🏆 Leaderboard — Polymarket Whales", """
         <td class="num">{{ w.trades }}</td>
         <td class="num">${{ "{:,.0f}".format(w.volume) }}</td>
         <td class="num">${{ "{:,.0f}".format(w.biggest) }}</td>
+        <td class="tag">{% if r.get("wins", 0) + r.get("losses", 0) > 0 %}{{ r.get("wins", 0) }}W–{{ r.get("losses", 0) }}L ({{ "{:.0%}".format(r["win_rate"]) }}){% else %}—{% endif %}</td>
+        <td class="num {{ 'yes' if r.get('realized_pnl', 0) >= 0 else 'no' }}">{{ "{:+,.0f}".format(r.get("realized_pnl", 0)) }}</td>
         <td class="num">{{ w.last_traded.strftime("%m-%d %H:%M") if w.last_traded else "—" }}</td>
         <td>{% if w.address not in watched %}
           <form class="inline" method="post" action="/watchlist/add">
@@ -428,7 +472,7 @@ LEADERBOARD_TEMPLATE = page("🏆 Leaderboard — Polymarket Whales", """
         {% else %}<span class="muted">watching</span>{% endif %}</td>
       </tr>
       {% else %}
-      <tr><td colspan="8" class="empty">No whale trades in this window yet.</td></tr>
+      <tr><td colspan="10" class="empty">No whale trades in this window yet.</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -668,6 +712,8 @@ def index():
     q = request.args.get("q", "").strip()
     category = request.args.get("category", "").strip()
     wallet = request.args.get("wallet", "").strip()
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = 100
 
     with Session() as session:
         query = session.query(WhaleTrade).order_by(WhaleTrade.traded_at.desc())
@@ -677,7 +723,8 @@ def index():
             query = query.filter(WhaleTrade.category == category)
         if wallet:
             query = query.filter(WhaleTrade.wallet == wallet.lower())
-        trades = query.limit(100).all()
+        total_count = query.order_by(None).count()
+        trades = query.offset((page - 1) * page_size).limit(page_size).all()
 
         categories = [
             c[0] for c in session.query(WhaleTrade.category)
@@ -686,20 +733,29 @@ def index():
         wallets = (
             session.query(Wallet).order_by(Wallet.total_usd.desc()).limit(20).all()
         )
+        wallet_records = {w.address: db.wallet_record(session, w.address) for w in wallets}
+        watched_set = {a.address for a in db.get_watched_addresses(session)}
         stats = db.get_stats(session)
         hourly = hourly_volume(session)
         tracker = db.tracker_health(session)
 
     hourly_max = max((h["volume"] for h in hourly), default=0)
+    total_pages = (total_count + page_size - 1) // page_size
+    pager_qs = "".join(f"{k}={v}&" for k, v in
+                       (("q", q), ("category", category), ("wallet", wallet)) if v)
     return render_template_string(
         TEMPLATE,
         stats=type("S", (), stats),
         trades=trades,
         wallets=wallets,
+        wallet_records=wallet_records,
+        watched_set=watched_set,
         categories=categories,
         hourly=hourly,
         hourly_max=hourly_max,
         q=q, category=category, wallet=wallet,
+        page=page, total_pages=total_pages, has_next=page < total_pages,
+        pager_qs=pager_qs,
         tracker=tracker,
     )
 
@@ -744,10 +800,11 @@ def leaderboard():
     with Session() as session:
         board = db.wallet_leaderboard(session, days=days)
         watched = {a.address for a in db.get_watched_addresses(session)}
+        records = {w["address"]: db.wallet_record(session, w["address"]) for w in board}
         tracker = db.tracker_health(session)
     return render_template_string(
         LEADERBOARD_TEMPLATE, board=board, days=days, watched=watched,
-        tracker=tracker,
+        records=records, tracker=tracker,
     )
 
 
@@ -830,6 +887,7 @@ def watchlist():
         pnl = db.positions_summary_db(session, [a.address for a in addresses])
         # Win/loss record + realized P&L from settled trades, per watched wallet
         records = {a.address: db.wallet_record(session, a.address) for a in addresses}
+        unwatched = db.unwatched_top_wallets(session, limit=10)
 
     positions_synced_at = max(
         (v["synced_at"] for v in pnl.values() if v.get("synced_at")), default=None)
@@ -862,6 +920,7 @@ def watchlist():
         labels=labels,
         pnl=pnl,
         records=records,
+        unwatched=unwatched,
         positions_synced_note=positions_synced_note,
         error=request.args.get("error", ""),
         tracker=tracker,
@@ -889,6 +948,118 @@ def watchlist_remove():
     with Session() as session:
         db.remove_watched_address(session, address)
     return redirect("/watchlist")
+
+
+def _iso(dt):
+    """None-safe datetime -> ISO 8601 string, for JSON responses."""
+    return dt.isoformat() if dt else None
+
+
+@app.route("/api/stats")
+def api_stats():
+    if Session is None:
+        return jsonify({"error": "Database unavailable"}), 503
+    with Session() as session:
+        stats = db.get_stats(session)
+        tracker = db.tracker_health(session)
+    return jsonify({
+        **stats,
+        "tracker_alive": tracker["alive"],
+        "tracker_last_poll": _iso(tracker["last_poll_at"]),
+    })
+
+
+@app.route("/api/trades")
+def api_trades():
+    if Session is None:
+        return jsonify({"error": "Database unavailable"}), 503
+    q = request.args.get("q", "").strip()
+    category = request.args.get("category", "").strip()
+    wallet = request.args.get("wallet", "").strip()
+    page = max(1, request.args.get("page", 1, type=int))
+    limit = min(500, request.args.get("limit", 100, type=int))
+
+    with Session() as session:
+        query = session.query(WhaleTrade).order_by(WhaleTrade.traded_at.desc())
+        if q:
+            query = query.filter(WhaleTrade.market_title.ilike(f"%{q}%"))
+        if category:
+            query = query.filter(WhaleTrade.category == category)
+        if wallet:
+            query = query.filter(WhaleTrade.wallet == wallet.lower())
+        total = query.order_by(None).count()
+        trades = query.offset((page - 1) * limit).limit(limit).all()
+
+    return jsonify({
+        "page": page, "limit": limit, "total": total,
+        "trades": [
+            {
+                "trade_id": t.trade_id, "condition_id": t.condition_id,
+                "market_title": t.market_title, "category": t.category,
+                "side": t.side, "price": t.price, "amount_usd": t.amount_usd,
+                "wallet": t.wallet, "traded_at": _iso(t.traded_at),
+                "result": t.result or "",
+            }
+            for t in trades
+        ],
+    })
+
+
+@app.route("/api/watchlist")
+def api_watchlist():
+    if Session is None:
+        return jsonify({"error": "Database unavailable"}), 503
+    with Session() as session:
+        addresses = db.get_watched_addresses(session)
+        stats = db.watched_address_stats(session)
+        pnl = db.positions_summary_db(session, [a.address for a in addresses])
+        records = {a.address: db.wallet_record(session, a.address) for a in addresses}
+
+    return jsonify({
+        "watchlist": [
+            {
+                "address": a.address, "label": a.label or "",
+                "added_at": _iso(a.added_at),
+                "trades": stats.get(a.address, {}).get("trades", 0),
+                "volume": stats.get(a.address, {}).get("volume", 0.0),
+                "last_traded": _iso(stats.get(a.address, {}).get("last_traded")),
+                "open_value": pnl.get(a.address, {}).get("value", 0.0),
+                "unrealized_pnl": pnl.get(a.address, {}).get("pnl", 0.0),
+                "positions_synced_at": _iso(pnl.get(a.address, {}).get("synced_at")),
+                "wins": records.get(a.address, {}).get("wins", 0),
+                "losses": records.get(a.address, {}).get("losses", 0),
+                "win_rate": records.get(a.address, {}).get("win_rate"),
+                "realized_pnl": records.get(a.address, {}).get("realized_pnl", 0.0),
+            }
+            for a in addresses
+        ],
+    })
+
+
+@app.route("/api/market/<condition_id>")
+def api_market(condition_id):
+    if Session is None:
+        return jsonify({"error": "Database unavailable"}), 503
+    condition_id = condition_id.strip().lower()
+    if not CONDITION_ID_RE.fullmatch(condition_id):
+        return jsonify({"error": "Invalid market condition ID"}), 404
+    with Session() as session:
+        market = session.get(Market, condition_id)
+        if market is None:
+            return jsonify({"error": "Market not found"}), 404
+        participants = db.market_participants(session, condition_id)
+
+    def _participant(p):
+        return {**p, "last_traded": _iso(p["last_traded"])}
+
+    return jsonify({
+        "condition_id": market.condition_id, "title": market.title,
+        "category": market.category, "resolved": bool(market.resolved),
+        "winning_outcome": market.winning_outcome,
+        "end_date": _iso(market.end_date),
+        "watched": [_participant(p) for p in participants["watched"]],
+        "unknown": [_participant(p) for p in participants["unknown"]],
+    })
 
 
 @app.route("/health")

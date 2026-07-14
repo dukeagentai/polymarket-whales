@@ -416,6 +416,25 @@ def watched_address_stats(session) -> dict:
     }
 
 
+def unwatched_top_wallets(session, limit: int = 10) -> list:
+    """Top wallets from the feed (the `wallets` table) that aren't already
+    on the watchlist — candidates worth a look, ranked by lifetime whale
+    volume. Returns [{address, tag, trade_count, total_usd, last_seen}]."""
+    watched = {a.address for a in session.query(WatchedAddress.address).all()}
+    rows = (
+        session.query(Wallet)
+        .order_by(Wallet.total_usd.desc())
+        .limit(limit + len(watched))
+        .all()
+    )
+    result = [w for w in rows if w.address not in watched][:limit]
+    return [
+        {"address": w.address, "tag": w.tag, "trade_count": w.trade_count,
+         "total_usd": w.total_usd, "last_seen": w.last_seen}
+        for w in result
+    ]
+
+
 def market_convergence(session, limit_trades: int = 2000) -> list:
     """
     Group watched-wallet trades by market so overlapping bets stand out.
@@ -842,3 +861,56 @@ def markets_index(session, limit: int = 200) -> list:
         }
         for m in markets
     ]
+
+
+def prune_old_trades(session, days: int) -> int:
+    """Delete whale_trades older than `days` whose market has resolved —
+    an open market's trades are kept regardless of age since they still
+    need to settle. watched_trades are never pruned (that's the user's own
+    record of wallets they chose to follow). Returns the number deleted."""
+    if not days or days <= 0:
+        return 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None)
+    resolved_ids = [m.condition_id for m in
+                   session.query(Market.condition_id).filter(Market.resolved == 1).all()]
+    if not resolved_ids:
+        return 0
+    deleted = (
+        session.query(WhaleTrade)
+        .filter(WhaleTrade.traded_at < cutoff,
+                WhaleTrade.condition_id.in_(resolved_ids))
+        .delete(synchronize_session=False)
+    )
+    session.commit()
+    return deleted
+
+
+def market_watched_settlement(session, condition_id: str) -> list:
+    """Per-watched-wallet result summary for one just-resolved market — used
+    to compose a single alert when a market with watched-wallet activity
+    resolves. Same PnL approximation as wallet_record (SELL trades count
+    toward wins/losses but are excluded from pnl). Returns
+    [{address, label, wins, losses, pnl}]."""
+    rows = (
+        session.query(WatchedTrade, WatchedAddress.label)
+        .join(WatchedAddress, WatchedAddress.address == WatchedTrade.address)
+        .filter(WatchedTrade.condition_id == condition_id, WatchedTrade.result != "")
+        .all()
+    )
+    per_wallet: dict = {}
+    for t, label in rows:
+        b = per_wallet.setdefault(t.address, {
+            "address": t.address, "label": label or "", "wins": 0,
+            "losses": 0, "pnl": 0.0,
+        })
+        is_sell = (t.side or "").strip().upper() == "SELL"
+        if t.result == "WIN":
+            b["wins"] += 1
+            if not is_sell:
+                shares = (t.amount_usd / t.price) if t.price else 0.0
+                b["pnl"] += shares - (t.amount_usd or 0)
+        else:
+            b["losses"] += 1
+            if not is_sell:
+                b["pnl"] -= (t.amount_usd or 0)
+    return list(per_wallet.values())

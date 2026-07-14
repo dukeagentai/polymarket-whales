@@ -1,6 +1,6 @@
 # TODO — Roadmap to make polymarket-whales feature-complete
 
-**Status: Phases 1-4 implemented.** Phase 1 (markets + resolution + settlement),
+**Status: Phases 1-6 implemented.** Phase 1 (markets + resolution + settlement),
 Phase 2 (realized PnL + win/loss records), Phase 3 (position sync — fixes the
 watchlist lag), and Phase 4 (market participant pages) are done — see
 `resolve_markets.py`, `sync_positions.py`, `migrate_002_trade_results.py`, and the
@@ -9,8 +9,26 @@ deviation from the plan worth knowing: Gamma's `/markets` endpoint implicitly
 filters to `closed=false` unless `closed=true` is passed explicitly, so
 `resolve_markets.py` does a two-phase fetch (plain query, then a `closed=true`
 retry for anything the first pass didn't return) — see the comment in
-`run_once()`. Phases 5-6 (tracked/unknown wallet promotion flow, JSON API,
-pagination, retention, tests) are still open.
+`run_once()`.
+
+Phase 5 (tracked/unknown wallet promotion flow) and Phase 6 (housekeeping) are
+also done: watched-wallet 👀 markers on the feed, an "Unknown wallets worth a
+look" card on `/watchlist`, win/loss Record + Realized P&L columns on
+`/leaderboard` and the top-wallets card, a `--max-keep-total` cap on
+`scout_leaderboard.py`; JSON API endpoints (`/api/stats`, `/api/trades`,
+`/api/watchlist`, `/api/market/<condition_id>`); pagination on the live feed
+(`?page=N`); composite DB indexes (`migrate_003_indexes.py`); a `retention_days`
+config knob (`prune_old_trades`, wired into `main.py`'s loop); Telegram/Discord
+alerts on market resolution via a shared `notify.py`; and a pytest suite under
+`tests/` (settlement, wallet_record, resolution parsing, main.py pure functions —
+run with `pytest tests/`, needs `requirements-dev.txt`).
+
+Two Phase 6 items were deliberately **not** implemented — both were flagged
+low-priority/deferred in the plan itself, not accidentally missed:
+- **Alert dedupe across restarts** (backfilling `SeenTrades` from the DB on
+  startup) — marked "low priority" in the original plan.
+- **WebSocket feed** instead of polling — marked "big item, keep last"; the
+  polling loop still works fine, this would be a larger architectural change.
 
 This is an implementation plan, ordered by priority. Each item says **what to build,
 where, the schema/function signatures to use, and how to verify it**. Follow the

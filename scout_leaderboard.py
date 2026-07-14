@@ -209,12 +209,25 @@ def scout(args) -> list:
         return kept
 
     with Session() as session:
+        existing = {a.address for a in db.get_watched_addresses(session)}
+        added = 0
+        skipped_cap = 0
         for w in kept:
+            # Cap only blocks *new* additions — a wallet already on the
+            # watchlist still gets its label refreshed with the latest rank/WR.
+            if w["address"] not in existing and len(existing) >= args.max_keep_total:
+                skipped_cap += 1
+                continue
             wr_txt = f"{w['win_rate']:.0%}" if w["win_rate"] is not None else "n/a"
             label = f"🏆 LB#{w['rank']} {w['userName']} · {wr_txt} WR · {w['trade_count']} trades"
             db.add_watched_address(session, w["address"], label[:128])
+            existing.add(w["address"])
+            added += 1
 
-    print(f"\n{Fore.GREEN}Added {len(kept)} wallets to the watchlist.{Style.RESET_ALL}")
+    print(f"\n{Fore.GREEN}Added/updated {added} wallet(s) on the watchlist.{Style.RESET_ALL}")
+    if skipped_cap:
+        print(f"{Fore.YELLOW}Skipped {skipped_cap} qualifying wallet(s) — watchlist already at "
+              f"the --max-keep-total cap ({args.max_keep_total}).{Style.RESET_ALL}")
     return kept
 
 
@@ -242,6 +255,10 @@ if __name__ == "__main__":
                         help="Seconds to sleep between API calls (default: 0.15)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Scan and report only — don't write to the watchlist")
+    parser.add_argument("--max-keep-total", type=int, default=100,
+                        help="Stop adding new wallets once the watchlist reaches this size "
+                             "(default: 100) — prevents unbounded growth on repeated runs. "
+                             "Wallets already on the watchlist still get their label refreshed.")
     args = parser.parse_args()
 
     try:

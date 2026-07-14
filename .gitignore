@@ -11,6 +11,7 @@ build/
 .venv/
 venv/
 env/
+.pytest_cache/
 
 # Logs
 *.log
