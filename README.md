@@ -131,6 +131,8 @@ Or edit `config.yaml` directly. Environment variables take priority.
 - ✅ JSON API (`/api/stats`, `/api/trades`, `/api/watchlist`, `/api/market/<condition_id>`) for programmatic access
 - ✅ Configurable data retention (`RETENTION_DAYS`) — prune resolved-market trades past a cutoff to keep the database lean
 - ✅ Automated pytest suite covering settlement, wallet PnL math, and resolution parsing
+- ✅ Leaderboard scout skip-already-watched optimization — re-vetting is now skipped for wallets already on the watchlist, using their live win/loss record from `resolve_markets.py` instead of re-fetching REDEEM history (`--top 300`/`--keep 300` by default)
+- ✅ Category scout (`category_scout.py`) — ranks wallets by real realized P&L within one Gamma category (weather, politics, sports, ...) over a trailing window, independent of the global leaderboard
 
 ---
 
@@ -315,14 +317,17 @@ Good first issues:
 - [x] Market pages — who's in a market, watched vs. unknown wallets (`/markets`, `/market/<condition_id>`)
 - [x] Scheduled/automated leaderboard scout runs (cron-safe via `--max-keep-total`, documented under [Deploy to Railway](#-deploy-to-railway))
 - [x] Test suite (`tests/` — settlement, wallet PnL/dedup math, resolution parsing, main.py pure functions)
+- [x] Leaderboard scout expanded to top 300 with a skip-already-watched optimization (re-vetting wallets we already track wastes API calls once the watchlist is populated — see `scout_leaderboard.py`)
+- [x] Per-category leaderboard scout (`category_scout.py`) — who's actually good at weather/politics/sports/etc., ranked by real realized P&L over a trailing window
 - [ ] Wallet PnL trend chart — `wallet_pnl_snapshots` are already being collected by `sync_positions.py`; no chart on `/wallet/<address>` surfaces the trend yet
 - [ ] Streamlit analytics mode (charts over historical whale data)
 - [ ] WebSocket feed instead of polling
+- [ ] Win-rate-weighted consensus alerts — weight the existing smart-money consensus check by (or require a minimum) average win rate among the converging wallets, using `db.wallet_record()`
+- [ ] Category leaderboard page in the dashboard — persist `category_scout.py` output to a table and add a `/leaderboard?category=weather`-style view
 - [ ] Slippage-aware alerting (surface whether a whale's trade meaningfully moved the price, not just its dollar size)
 - [ ] Multi-wallet correlation across time (same cluster of wallets repeatedly moving together, beyond a single market)
 - [ ] Backtest mode — replay historical trades through the alert rules to tune thresholds before going live
-- [ ] Rate-limit / backoff tuning for the leaderboard scout (currently a flat `--pause` between calls)
-- [ ] Per-category leaderboard scout — see `todo.md` for the planned `category_scout.py`
+- [ ] Rate-limit / backoff tuning for the leaderboard/category scouts (currently a flat `--pause` between calls)
 
 Open an issue or send a PR — both welcome.
 

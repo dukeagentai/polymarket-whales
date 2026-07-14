@@ -145,6 +145,12 @@ def scout(args) -> list:
     board = fetch_leaderboard(args.top, args.order_by, args.time_period, args.category)
     print(f"Fetched {len(board)} traders from Polymarket's leaderboard.\n")
 
+    Session = db.init_db()
+    already_watched = set()
+    if Session:
+        with Session() as session:
+            already_watched = {a.address for a in db.get_watched_addresses(session)}
+
     qualified = []
     for i, entry in enumerate(board, 1):
         address = entry.get("proxyWallet", "")
@@ -159,6 +165,25 @@ def scout(args) -> list:
             continue
         if pnl <= 0:
             print(f"  [{i:>3}] {name:<20} skip — lifetime PnL ${pnl:,.0f} <= $0")
+            continue
+
+        if address.lower() in already_watched:
+            # Already watched — resolve_markets.py has been continuously
+            # settling this wallet's trades, so db.wallet_record() gives a
+            # live, exact win/loss + realized PnL. Skip the expensive
+            # REDEEM-based vetting and just refresh its label from that.
+            with Session() as session:
+                record = db.wallet_record(session, address)
+            wr_txt = f"{record['win_rate']:.0%}" if record["win_rate"] is not None else "n/a"
+            print(f"  [{i:>3}] {name:<20} {Fore.CYAN}ALREADY WATCHED{Style.RESET_ALL} — "
+                  f"skipping re-vet (live record: {record['wins']}W-{record['losses']}L, {wr_txt} WR)")
+            qualified.append({
+                "rank": entry.get("rank"), "address": address, "userName": name,
+                "vol": vol, "pnl": pnl, "trade_count": None, "trades_capped": False,
+                "decided_markets": record["wins"] + record["losses"],
+                "wins": record["wins"], "win_rate": record["win_rate"],
+                "already_watched": True,
+            })
             continue
 
         stats = evaluate_wallet(address, args.pause)
@@ -185,7 +210,7 @@ def scout(args) -> list:
               f"{wr_txt} win rate ({decided} decided)")
         qualified.append({
             "rank": entry.get("rank"), "address": address, "userName": name,
-            "vol": vol, "pnl": pnl, **stats,
+            "vol": vol, "pnl": pnl, "already_watched": False, **stats,
         })
 
     qualified.sort(key=lambda w: w["pnl"], reverse=True)
@@ -195,15 +220,17 @@ def scout(args) -> list:
     print(f"{len(qualified)} of {len(board)} qualified — keeping top {len(kept)} by PnL.\n")
     for rank, w in enumerate(kept, 1):
         wr_txt = f"{w['win_rate']:.0%}" if w["win_rate"] is not None else "n/a"
-        trades_txt = f"{w['trade_count']}+" if w["trades_capped"] else str(w["trade_count"])
+        if w["trade_count"] is None:
+            trades_txt = f"{w['decided_markets']} settled (live)"
+        else:
+            trades_txt = f"{w['trade_count']}+ trades" if w["trades_capped"] else f"{w['trade_count']} trades"
         print(f"  {rank:>2}. {w['userName']:<20} {w['address']}  "
-              f"${w['pnl']:>12,.0f} pnl  {wr_txt:>5} WR  {trades_txt:>5} trades")
+              f"${w['pnl']:>12,.0f} pnl  {wr_txt:>5} WR  {trades_txt}")
 
     if args.dry_run:
         print(f"\n{Fore.YELLOW}Dry run — nothing written to the watchlist.{Style.RESET_ALL}")
         return kept
 
-    Session = db.init_db()
     if not Session:
         print(f"\n{Fore.RED}No database available — can't write to the watchlist.{Style.RESET_ALL}")
         return kept
@@ -219,7 +246,10 @@ def scout(args) -> list:
                 skipped_cap += 1
                 continue
             wr_txt = f"{w['win_rate']:.0%}" if w["win_rate"] is not None else "n/a"
-            label = f"🏆 LB#{w['rank']} {w['userName']} · {wr_txt} WR · {w['trade_count']} trades"
+            if w["already_watched"]:
+                label = f"🏆 LB#{w['rank']} {w['userName']} · {wr_txt} WR (live) · {w['decided_markets']} settled"
+            else:
+                label = f"🏆 LB#{w['rank']} {w['userName']} · {wr_txt} WR · {w['trade_count']} trades"
             db.add_watched_address(session, w["address"], label[:128])
             existing.add(w["address"])
             added += 1
@@ -233,8 +263,11 @@ def scout(args) -> list:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scout Polymarket's leaderboard for wallets worth watching")
-    parser.add_argument("--top", type=int, default=100, help="How many leaderboard entries to pull (default: 100)")
-    parser.add_argument("--keep", type=int, default=30, help="Max wallets to keep/watch (default: 30)")
+    parser.add_argument("--top", type=int, default=300, help="How many leaderboard entries to pull (default: 300)")
+    parser.add_argument("--keep", type=int, default=300,
+                        help="Per-run cap on qualifiers to keep (default: 300, i.e. keep every "
+                             "qualifier). --max-keep-total, not --keep, is the standing cap on "
+                             "watchlist size across runs.")
     parser.add_argument("--order-by", choices=["PNL", "VOL"], default="PNL",
                         help="Leaderboard ranking metric (default: PNL)")
     parser.add_argument("--time-period", choices=["DAY", "WEEK", "MONTH", "ALL"], default="ALL",

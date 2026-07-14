@@ -3,8 +3,11 @@
 **Status:** the previous roadmap (markets/resolution tracking, realized PnL,
 position sync, market pages, tracked/unknown wallet flow, JSON API, pagination,
 retention, tests) is fully implemented — see git history and the README's
-Features list. This file now tracks what's next. Each item below is detailed
-enough for a lower model to implement without re-deriving the design.
+Features list. Sections 1 and 2 below (`scout_leaderboard.py` top-300 +
+skip-already-watched, and `category_scout.py`) are also now implemented and
+verified against the live API — see git history. Section 3 (lighter ideas)
+is what's next. Each item below is detailed enough for a lower model to
+implement without re-deriving the design.
 
 Follow the existing code style: standalone scripts shaped like
 `scout_leaderboard.py` / `resolve_markets.py` (argparse, `colorama` output,
