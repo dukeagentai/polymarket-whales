@@ -1,447 +1,285 @@
-# TODO — Roadmap to make polymarket-whales feature-complete
+# TODO — Upcoming features
 
-**Status: Phases 1-6 implemented.** Phase 1 (markets + resolution + settlement),
-Phase 2 (realized PnL + win/loss records), Phase 3 (position sync — fixes the
-watchlist lag), and Phase 4 (market participant pages) are done — see
-`resolve_markets.py`, `sync_positions.py`, `migrate_002_trade_results.py`, and the
-`Market`/`WalletPnlSnapshot`/`WalletPosition` tables + helpers in `db.py`. One
-deviation from the plan worth knowing: Gamma's `/markets` endpoint implicitly
-filters to `closed=false` unless `closed=true` is passed explicitly, so
-`resolve_markets.py` does a two-phase fetch (plain query, then a `closed=true`
-retry for anything the first pass didn't return) — see the comment in
-`run_once()`.
+**Status:** the previous roadmap (markets/resolution tracking, realized PnL,
+position sync, market pages, tracked/unknown wallet flow, JSON API, pagination,
+retention, tests) is fully implemented — see git history and the README's
+Features list. This file now tracks what's next. Each item below is detailed
+enough for a lower model to implement without re-deriving the design.
 
-Phase 5 (tracked/unknown wallet promotion flow) and Phase 6 (housekeeping) are
-also done: watched-wallet 👀 markers on the feed, an "Unknown wallets worth a
-look" card on `/watchlist`, win/loss Record + Realized P&L columns on
-`/leaderboard` and the top-wallets card, a `--max-keep-total` cap on
-`scout_leaderboard.py`; JSON API endpoints (`/api/stats`, `/api/trades`,
-`/api/watchlist`, `/api/market/<condition_id>`); pagination on the live feed
-(`?page=N`); composite DB indexes (`migrate_003_indexes.py`); a `retention_days`
-config knob (`prune_old_trades`, wired into `main.py`'s loop); Telegram/Discord
-alerts on market resolution via a shared `notify.py`; and a pytest suite under
-`tests/` (settlement, wallet_record, resolution parsing, main.py pure functions —
-run with `pytest tests/`, needs `requirements-dev.txt`).
-
-Two Phase 6 items were deliberately **not** implemented — both were flagged
-low-priority/deferred in the plan itself, not accidentally missed:
-- **Alert dedupe across restarts** (backfilling `SeenTrades` from the DB on
-  startup) — marked "low priority" in the original plan.
-- **WebSocket feed** instead of polling — marked "big item, keep last"; the
-  polling loop still works fine, this would be a larger architectural change.
-
-This is an implementation plan, ordered by priority. Each item says **what to build,
-where, the schema/function signatures to use, and how to verify it**. Follow the
-existing code style (SQLAlchemy models in `db.py`, plain functions, emoji log lines).
-
-Context on the current architecture (do not change it):
-
-- **Two processes**: `main.py` (polling worker, writes trades) and `dashboard.py`
-  (Flask, reads DB + makes some live API calls). They share one DB (SQLite locally,
-  Postgres on Railway via `DATABASE_URL`).
-- Tables today: `whale_trades` (feed trades ≥ threshold), `wallets` (auto-tracked
-  stats per wallet seen in the feed), `watched_addresses` (user watchlist),
-  `watched_trades` (all trades by watched wallets), `tracker_status` (heartbeat).
-- APIs: `data-api.polymarket.com` (trades, positions, activity, leaderboard — public),
-  `gamma-api.polymarket.com` (market metadata; use `condition_ids` param). The CLOB
-  API needs auth — don't use it.
-- `Base.metadata.create_all()` creates new tables automatically, but does **not**
-  add columns to existing tables. Any new column on an existing table needs a
-  migration script like `migrate_001_widen_trade_id.py` (copy that pattern:
-  idempotent, works on both SQLite and Postgres).
+Follow the existing code style: standalone scripts shaped like
+`scout_leaderboard.py` / `resolve_markets.py` (argparse, `colorama` output,
+`db.init_db()`), SQLAlchemy models/helpers in `db.py`, no new abstractions
+beyond what's asked.
 
 ---
 
-## Phase 1 — Markets as first-class entities + resolution tracking
+## 1. Expand `scout_leaderboard.py` to the top 300 (prod usage)
 
-**Why:** We currently store only a market title string on each trade. We never learn
-whether a market resolved or who won, so we can't compute realized win/loss for any
-wallet. Everything in Phases 2–3 depends on this.
+**Why:** wider candidate pool = better odds of finding genuinely sharp
+traders instead of just the highest-volume ones. Running this weekly against
+300 candidates means most of the pool will already be on the watchlist after
+the first run or two — re-vetting all of them every time is wasted API calls
+we don't need, because we now have better data for anyone already watched
+(see below).
 
-### 1.1 New `markets` table (`db.py`)
+### 1.1 Bump the default pool size
 
-```python
-class Market(Base):
-    __tablename__ = "markets"
+In `scout_leaderboard.py`'s argparse section:
+- `--top` default: `100` → `300`.
+- `--keep` default: `30` → `300` (i.e. keep every qualifier by default —
+  `--max-keep-total`, already implemented, is the real ceiling on watchlist
+  growth, not `--keep`). Update the help text on both to explain the
+  relationship: "keep is a per-run cap on qualifiers; max-keep-total is the
+  standing cap on watchlist size across runs."
 
-    condition_id = Column(String(128), primary_key=True)
-    title        = Column(String(512), default="")
-    slug         = Column(String(256), default="")
-    event_slug   = Column(String(256), default="")
-    category     = Column(String(128), default="", index=True)
-    end_date     = Column(DateTime, nullable=True)        # from Gamma endDate
-    # Resolution state
-    resolved     = Column(Integer, default=0, index=True) # 0 = open, 1 = resolved
-    winning_outcome = Column(String(128), default="")     # "Yes" / "No" / "France" / ...
-    resolved_at  = Column(DateTime, nullable=True)        # when WE detected it
-    # Bookkeeping
-    first_seen   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_checked = Column(DateTime, nullable=True)        # last resolution poll
-```
+### 1.2 Skip re-vetting wallets already on the watchlist
 
-Helper functions to add in `db.py`:
+Right now `scout()` calls `evaluate_wallet()` (paginated `/trades` +
+`/activity?type=REDEEM` + a `/markets?closed=true` batch call) for **every**
+candidate that passes the cheap capital/PnL filter — including wallets we
+already watch and already have better data for, since
+`resolve_markets.py` has been continuously settling their trades and
+`db.wallet_record()` gives a live, exact win/loss + realized PnL (not the
+REDEEM-based approximation `evaluate_wallet()` uses). Re-vetting them is
+pure waste once the watchlist is populated.
 
-- `upsert_market(session, *, condition_id, title="", slug="", event_slug="", category="", end_date=None)`
-  — insert if missing, fill in blanks if known fields are empty. Never overwrite a
-  non-empty title with an empty one. Call `session.commit()`.
-- `unresolved_markets(session, limit=100)` — markets with `resolved == 0`, ordered by
-  `last_checked` ascending nulls-first (check the never-checked ones first). Note:
-  SQLite and Postgres order NULLs differently — use
-  `order_by(Market.last_checked.is_(None).desc(), Market.last_checked.asc())` which
-  works on both.
-- `mark_market_resolved(session, condition_id, winning_outcome)` — set
-  `resolved=1`, `winning_outcome`, `resolved_at=now`.
+Change in `scout()` (`scout_leaderboard.py`):
 
-### 1.2 Populate `markets` from the trade pipeline (`main.py`)
+1. At the top of `scout()`, before the loop, open a DB session and fetch
+   `existing = {a.address for a in db.get_watched_addresses(session)}` —
+   guard with `Session = db.init_db()`; if unavailable, fall back to the
+   current behavior (vet everyone, since there's nothing to compare against).
+2. Inside the per-candidate loop, right after the capital/PnL cheap filter
+   and before calling `evaluate_wallet()`:
+   ```python
+   if address in existing:
+       # Already watched — we have live, continuously-updated stats for
+       # this wallet from resolve_markets.py; skip the expensive REDEEM-based
+       # vetting and just refresh its label from the leaderboard's cheap
+       # fields plus our own db.wallet_record() (real win rate, not approximated).
+       with Session() as session:
+           record = db.wallet_record(session, address)
+       wr_txt = f"{record['win_rate']:.0%}" if record["win_rate"] is not None else "n/a"
+       print(f"  [{i:>3}] {name:<20} {Fore.CYAN}ALREADY WATCHED{Style.RESET_ALL} — "
+             f"skipping re-vet (live record: {record['wins']}W-{record['losses']}L, {wr_txt} WR)")
+       qualified.append({
+           "rank": entry.get("rank"), "address": address, "userName": name,
+           "vol": vol, "pnl": pnl, "trade_count": None, "trades_capped": False,
+           "decided_markets": record["wins"] + record["losses"],
+           "wins": record["wins"], "win_rate": record["win_rate"],
+           "already_watched": True,
+       })
+       continue
+   ```
+   Then the existing `evaluate_wallet()` path runs unchanged for everyone
+   else, tagging its results with `"already_watched": False`.
+3. Sorting/keeping logic (`qualified.sort(...)`, `kept = qualified[:args.keep]`)
+   stays the same — already-watched wallets just skip straight to
+   "qualified" without the vetting cost, and their PnL for sorting purposes
+   is the leaderboard's `pnl` field (same as everyone else uses for sorting
+   today — no change needed there).
+4. In the final DB-write loop, the label format needs a branch: for
+   `already_watched` entries, build the label from `db.wallet_record()`
+   data instead of `evaluate_wallet()`'s `win_rate`/`trade_count` (which are
+   `None` for these). Something like:
+   `f"🏆 LB#{rank} {name} · {live_win_rate} WR (live) · {wins+losses} settled"`.
 
-In `run()`, at the point where a whale trade or watched trade is persisted (both
-branches), also call `db.upsert_market(...)` in the same `with Session()` block,
-using data already in hand: `condition_id`, `base_title`, `trade.get("slug", "")`,
-`trade.get("eventSlug", "")`, `category`, and `end_date` if the trade payload has
-`endDate` (it usually doesn't — leave None, the resolution checker fills it in).
-Skip when `condition_id` is empty.
-
-### 1.3 Resolution checker (new file: `resolve_markets.py`)
-
-A standalone script, same shape as `scout_leaderboard.py` (argparse, `db.init_db()`,
-colorama output), that can be run manually, by cron, or in a loop:
-
-```
-python resolve_markets.py            # one pass over unresolved markets
-python resolve_markets.py --loop 900 # run forever, one pass every 15 min
-python resolve_markets.py --limit 50 # cap markets checked per pass
-```
-
-Per pass:
-
-1. `unresolved_markets(session, limit=args.limit)` → list of condition_ids.
-2. Batch them 20 at a time against Gamma:
-   `GET https://gamma-api.polymarket.com/markets?condition_ids=<id1>&condition_ids=<id2>&...`
-   (pass a list to `requests` params: `{"condition_ids": chunk}`). Sleep
-   `--pause` (default 0.2s) between chunks — copy `_get_json` retry helper from
-   `scout_leaderboard.py`.
-3. For each returned market object:
-   - Update blanks on our row (title, slug, category, `endDate` → `end_date`,
-     parse with `datetime.fromisoformat(s.replace("Z", "+00:00"))`).
-   - Detect resolution: Gamma marks finished markets with `closed: true` and
-     exposes `outcomePrices` (JSON string like `'["1", "0"]'`) plus `outcomes`
-     (JSON string like `'["Yes", "No"]'`). A market is **resolved** when
-     `closed` is true AND some outcome price is ≥ 0.99. The winning outcome is
-     `outcomes[i]` where `outcomePrices[i]` is the max. Both fields arrive as
-     JSON-encoded strings — `json.loads` them, guard with try/except.
-   - If resolved → `mark_market_resolved(...)`, log a line, and run the
-     settlement step (1.4) for that market.
-   - Whether or not resolved, set `last_checked = now` and commit.
-4. Markets Gamma didn't return at all: still bump `last_checked` so they don't
-   block the queue forever.
-
-Also handle **stale markets**: if a market's `end_date` is more than 30 days past
-and Gamma still doesn't report it closed, log it but keep checking (some markets
-resolve very late) — do NOT auto-resolve on end_date alone.
-
-**Deploy:** add to `Procfile` docs/README — on Railway this is a third service with
-start command `python resolve_markets.py --loop 900`, or use Railway's cron feature
-with `python resolve_markets.py`. Locally: `--loop` mode.
-
-### 1.4 Settlement — mark trades won/lost when a market resolves
-
-Add columns to `whale_trades` and `watched_trades` (**requires a migration script**,
-`migrate_002_trade_results.py`, modeled on `migrate_001`):
-
-```python
-# on both WhaleTrade and WatchedTrade:
-result = Column(String(8), default="", index=True)  # "" = open, "WIN", "LOSS"
-```
-
-Add in `db.py`:
-
-```python
-def settle_market_trades(session, condition_id: str, winning_outcome: str) -> dict:
-    """Mark every trade in a resolved market WIN or LOSS.
-    Returns {"whale_trades": n, "watched_trades": n} counts updated."""
-```
-
-Rules (keep them simple and explicit — a trade is a bet on an outcome):
-
-- `watched_trades` rows have `outcome` (what they bet on) and `side` (BUY/SELL).
-  - BUY of the winning outcome → WIN; BUY of a losing outcome → LOSS.
-  - SELL of the winning outcome → LOSS; SELL of a losing outcome → WIN.
-  - Compare case-insensitively, strip whitespace.
-- `whale_trades` rows only have `side` (already normalized YES/NO for binary
-  markets, or the raw outcome name for multi-outcome). Same comparison:
-  `side == winning_outcome` (case-insensitive) → WIN, else LOSS. For YES/NO
-  markets Gamma's outcomes are "Yes"/"No", so uppercase both sides before comparing.
-- Only touch rows where `result == ""` (idempotent — safe to re-run).
-
-Call `settle_market_trades` from `resolve_markets.py` right after
-`mark_market_resolved`.
-
-### 1.5 Verification for Phase 1
-
-- Run the tracker a few minutes so `markets` fills up, then `python
-  resolve_markets.py --limit 10` and confirm rows get `last_checked` set.
-- Manually insert a market row with a condition_id of an already-resolved market
-  (grab one from Gamma with `closed=true`), insert a fake watched_trade on it,
-  run the checker, confirm `result` flips to WIN/LOSS correctly for both a BUY
-  of the winner and a BUY of the loser.
+### 1.3 Verification
+- Run `python scout_leaderboard.py --dry-run --top 300` against prod (or a
+  copy of the DB) and confirm: (a) it completes noticeably faster on a
+  second run than the first once most candidates are watched, (b) the
+  "ALREADY WATCHED" skip path prints for wallets known to be on the
+  watchlist, (c) newly-seen candidates still go through full vetting.
+- Confirm `--max-keep-total` (existing, default 100) still caps how many
+  brand-new wallets get added even with `--top 300 --keep 300`.
 
 ---
 
-## Phase 2 — Realized P&L + win/loss records per wallet
+## 2. `category_scout.py` — per-category "who's actually good at this" analysis
 
-**Why:** the user wants PnL and win/lose per wallet, computed from OUR recorded
-history (works for both watched wallets and random feed whales) — not just the
-live unrealized number from the positions API.
+**Why:** the existing leaderboard scout ranks wallets globally. This answers
+a different question: *within one contract category (weather, politics,
+sports, ...), who has the best real track record over a recent window?*
+That surfaces specialists the global leaderboard would never highlight (a
+wallet that's mediocre overall but crushes weather markets specifically).
 
-### 2.1 Per-wallet record aggregation (`db.py`)
+**Confirmed via live API testing this session** (do this yourself again if
+building later — Polymarket's data shapes drift):
+- `GET gamma-api.polymarket.com/events?tag_slug=<category>&closed=true&order=endDate&ascending=false&limit=&offset=`
+  returns closed events for a category, each with a nested `markets: [...]`
+  list containing `conditionId`, `outcomes`, `outcomePrices`, `endDate`,
+  `closed`. Tested with `tag_slug=weather` — returned genuine weather
+  events (e.g. "Highest temperature in Paris on July 13?").
+  **`tag_slug` is the correct param — `tag` (no `_slug`) silently ignores
+  the filter and returns unrelated events.** This mirrors the
+  `resolve_markets.py` `closed=true` quirk already documented in git
+  history — verify empirically, don't assume.
+- `GET data-api.polymarket.com/trades?market=<condition_id>&limit=&offset=`
+  returns every trade in that specific market (not filtered by wallet) —
+  confirmed fields: `proxyWallet`, `side` (BUY/SELL), `outcome`, `size`,
+  `price`, `timestamp`. This is the key building block: iterate markets, not
+  wallets, to discover *every* participant in a category, not just wallets
+  already in our DB.
+- Gamma's tag vocabulary (`tag_slug`) is a **different vocabulary** from
+  `scout_leaderboard.py`'s `--category` choices (which are the
+  `/v1/leaderboard` API's own category enum: `OVERALL`, `POLITICS`, `SPORTS`,
+  `WEATHER`, etc., uppercase). Don't assume they're interchangeable — verify
+  the `tag_slug` for whatever category the user wants via
+  `gamma-api.polymarket.com/tags` (paginated) or empirically, same as
+  `weather` was confirmed here.
 
-```python
-def wallet_record(session, address: str) -> dict:
-    """Win/loss record from settled trades (both tables, deduped by trade_id).
-    Returns {"wins": int, "losses": int, "open": int, "win_rate": float|None,
-             "realized_pnl": float}"""
+### 2.1 CLI shape
+
+```bash
+python category_scout.py --category weather                    # trailing 7 days, print top 100
+python category_scout.py --category weather --days 14           # wider window
+python category_scout.py --category weather --top 200           # rank more than 100
+python category_scout.py --category weather --export weather.csv
+python category_scout.py --category weather --watch-top 20      # also add top 20 to the watchlist
 ```
 
-- Wins/losses: count settled rows per table for this wallet
-  (`WhaleTrade.wallet == address` / `WatchedTrade.address == address`). A trade
-  present in both tables (watched wallet whose trade was also whale-sized) must
-  count once — collect `trade_id` sets and union them.
-- **Realized PnL per settled BUY trade** (approximation from our data —
-  document this in the docstring):
-  - WIN: shares won pay out $1 each. Shares ≈ `amount_usd / price` (guard
-    price ≤ 0). PnL = `shares * 1.0 - amount_usd`.
-  - LOSS: PnL = `-amount_usd`.
-  - SELL trades: skip in v1 (we don't know their cost basis). Count them in
-    wins/losses but exclude from realized_pnl, and note it in the docstring.
-- `win_rate = wins / (wins + losses)` or None when nothing settled.
+- `--category` (required): a Gamma `tag_slug` string, e.g. `weather`,
+  `politics`, `sports`, `crypto`, `elections` — passed straight through as
+  the `tag_slug` param, no translation table needed (keep it simple; if a
+  slug doesn't exist Gamma just returns zero events, which the script should
+  report plainly rather than erroring).
+- `--days` (default 7): only include markets whose `endDate` falls within
+  the trailing N days (i.e. "last week's contracts").
+- `--top` (default 100): how many ranked wallets to print/export.
+- `--max-markets` (default 300): safety cap on how many resolved markets to
+  pull per run — some categories (Sports) could have thousands of
+  micro-markets in a week; cap it and log a warning if the cap is hit.
+- `--pause` (default 0.15s): sleep between paginated API calls, same
+  convention as `scout_leaderboard.py`.
+- `--export PATH.csv|.json`: dump the full ranked list (reuse `main.py`'s
+  `export_trade`-style CSV/JSON append pattern, or write a small dedicated
+  writer — this is a one-shot full dump, not an append-per-trade log, so a
+  simple `csv.DictWriter` / `json.dump` over the whole ranked list is
+  simpler than reusing `export_trade` as-is).
+- `--watch-top N` (optional, default 0 = off): add the top N ranked wallets
+  to the watchlist via `db.add_watched_address`, labeled with the category
+  and rank, e.g. `"🌦️ Weather #3 · 82% WR · +$12,400 (7d)"`. Respect the
+  same `--max-keep-total`-style cap as `scout_leaderboard.py` (reuse the
+  identical guard: skip *new* additions once the watchlist is at the cap,
+  still refresh labels for wallets already watched).
 
-### 2.2 PnL history snapshots (new table)
+### 2.2 Algorithm
 
-The README already lists "Wallet PnL tracking over time" as a wanted feature.
+1. **Fetch resolved events in the category over the window.**
+   Page `events?tag_slug=<category>&closed=true&order=endDate&ascending=false`
+   (limit/offset), stop paging once a page's oldest `endDate` is older than
+   `now - days` (results are ordered newest-first, so this is a clean early
+   exit — don't keep paging past the window).
+2. **Flatten to markets.** Each event can have multiple nested `markets`
+   (e.g. a multi-outcome election) — collect every market's `conditionId`,
+   `outcomes`, `outcomePrices`, capped at `--max-markets` total.
+3. **Determine the winning outcome per market.** Reuse
+   `resolve_markets.check_resolution(market_dict)` — `import` it directly
+   from `resolve_markets.py` rather than re-implementing the
+   JSON-string-parsing + threshold logic. Skip any market where this
+   returns `""` (shouldn't happen since we filtered `closed=true`, but a
+   market can be `closed` without fully-settled `outcomePrices` in edge
+   cases — skip rather than crash).
+4. **Pull every trade in each market.** For each market's `conditionId`,
+   page `data-api.polymarket.com/trades?market=<conditionId>&limit=500&offset=`
+   (same `TRADE_PAGE_SIZE`/`TRADE_MAX_PAGES` capping convention as
+   `scout_leaderboard.py`'s `evaluate_wallet()` — reuse those constants or
+   define local equivalents) until exhausted or capped.
+5. **Aggregate per wallet across every market in the category-week.** For
+   each trade: `wallet = trade["proxyWallet"].lower()`,
+   `amount_usd = float(trade["size"]) * float(trade["price"])` (same
+   formula as `main.py`'s `parse_trade_usd_size` — reuse it or duplicate the
+   one-liner), `is_sell = trade["side"].upper() == "SELL"`,
+   `is_winner = trade["outcome"].strip().upper() == winning_outcome.strip().upper()`.
+   Apply the **exact same WIN/LOSS/PnL rules as
+   `db.settle_market_trades`/`db.wallet_record`**: BUY+winner=WIN,
+   BUY+loser=LOSS, SELL+winner=LOSS, SELL+loser=WIN; realized PnL only
+   accrues on BUY trades (`shares = amount_usd/price; pnl = shares -
+   amount_usd` for WIN, `pnl = -amount_usd` for LOSS); SELL trades count
+   toward win/loss but not PnL (no cost basis, identical caveat to
+   `wallet_record`'s docstring). Accumulate per wallet: `trades`, `volume`,
+   `wins`, `losses`, `realized_pnl`.
+6. **Rank and output.** Sort by `realized_pnl` descending, take `--top`.
+   Print a colorama table (rank, address, trades, volume, W-L, win rate,
+   realized PnL) matching `scout_leaderboard.py`'s print style. If
+   `--export` is set, dump the full ranked list. If `--watch-top N` is set,
+   add the top N to the watchlist (per 2.1).
 
-```python
-class WalletPnlSnapshot(Base):
-    __tablename__ = "wallet_pnl_snapshots"
+### 2.3 Edge cases / notes for the implementer
+- A wallet trading in 50 different weather markets in the window should
+  show one aggregated row, not 50 — aggregate by `proxyWallet`, not by
+  trade.
+- Don't dedupe trades against our own `whale_trades`/`watched_trades`
+  tables — this script is deliberately independent of what we've already
+  recorded, since the whole point is finding wallets we *don't* already
+  track. It reads live from the API only; it doesn't touch
+  `whale_trades`/`watched_trades` at all (only optionally writes to
+  `watched_addresses` via `--watch-top`).
+- Rate limits: a category with thousands of resolved markets in a week
+  (Sports is the obvious risk) could mean thousands of paginated `/trades`
+  calls. `--max-markets` is the safety valve — log clearly how many markets
+  were skipped due to the cap so the user knows the ranking is partial.
+- No new DB tables needed. This script is stateless analysis + an optional
+  watchlist write; it doesn't need its own persistence.
 
-    id          = Column(Integer, primary_key=True)
-    address     = Column(String(64), index=True)
-    taken_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
-    open_value  = Column(Float, default=0.0)   # from positions API
-    unrealized  = Column(Float, default=0.0)   # from positions API (cashPnl sum)
-    realized    = Column(Float, default=0.0)   # from wallet_record()
-    wins        = Column(Integer, default=0)
-    losses      = Column(Integer, default=0)
-```
-
-Snapshots are written by the position-sync job (Phase 3.2) once per sync cycle,
-but at most one snapshot per wallet per 6 hours (check the latest `taken_at`
-before inserting).
-
-### 2.3 Surface it in the UI (`dashboard.py`)
-
-- `/wallet/<address>`: add tiles "Record" (`12W–5L (71%)`) and "Realized P&L"
-  from `wallet_record()`. Add a small sparkline-style section for snapshot
-  history later (optional — plain table of snapshots is fine for v1).
-- `/watchlist`: add "Record" and "Realized P&L" columns next to the existing
-  unrealized P&L column.
-- Recent-trades tables (`/`, `/watchlist`, `/wallet/...`): show a ✅/❌ marker
-  on rows where `result` is WIN/LOSS (empty string → no marker).
+### 2.4 Verification
+- Run `python category_scout.py --category weather --days 7` against the
+  live API (no `--watch-top`, no `--export`) and manually spot-check: does
+  the #1 ranked wallet's PnL look plausible against a couple of its trades
+  pulled directly from `data-api.polymarket.com/trades?user=<address>`?
+- Run with `--max-markets 5` on a busier category (e.g. `sports`) to confirm
+  the cap and warning message work without hammering the API during
+  development.
+- Run with `--watch-top 3 --dry-run`-equivalent (add a `--dry-run` flag
+  mirroring `scout_leaderboard.py`'s, so this can be tested without
+  mutating the real watchlist) and confirm the labels look right before
+  wiring up the real `add_watched_address` calls.
 
 ---
 
-## Phase 3 — Stop ad-hoc API calls from blocking page loads
+## 3. Other ideas worth considering (lighter detail — flesh out if picked up)
 
-**Why (user's complaint):** `/watchlist` calls `fetch_positions()` synchronously
-for EVERY watched address on every page load (dashboard.py, the
-`pnl = {a.address: positions_summary(fetch_positions(a.address)) ...}` line).
-With 30 watched wallets and a cold cache that's 30 sequential HTTP calls × up to
-8s timeout each — that's the lag. Fix: the worker syncs positions into the DB in
-the background; the dashboard only reads the DB.
+Ordered roughly by how much they leverage what's already built vs. how much
+new surface area they'd add.
 
-### 3.1 New `wallet_positions` table (`db.py`)
+- **Win-rate-weighted consensus alerts.** The existing smart-money
+  consensus alert (`db.market_side_whales` in `main.py`) counts *distinct
+  wallets* on one side of a market — it doesn't know if those wallets are
+  any good. Now that `db.wallet_record()` gives a real win rate per wallet,
+  the consensus check could weight by (or require a minimum) average win
+  rate among the converging wallets, so "3 random whales agree" and "3
+  wallets with 70%+ win rates agree" aren't treated the same. Lowest-effort,
+  highest-leverage item on this list — it's a filter change to an existing
+  alert, not a new subsystem.
+- **Category leaderboard page in the dashboard.** Once `category_scout.py`
+  exists, its output is only as useful as the last time someone ran it.
+  Store results in a new small table (e.g. `category_leaders(category,
+  address, rank, wins, losses, realized_pnl, computed_at)`) written each
+  time the script runs, and add a `/leaderboard?category=weather`-style view
+  reading from it — turns a CLI report into a living dashboard page.
+- **Wallet PnL trend chart.** `wallet_pnl_snapshots` (built in the previous
+  round, written by `sync_positions.py`) is already collecting the data —
+  nothing on `/wallet/<address>` renders it yet. A simple table or sparkline
+  of `db.pnl_snapshot_history()` closes this loop with no new backend work.
+- **Slippage-aware alerting.** Surface whether a whale's trade meaningfully
+  moved the price (compare pre-trade vs. post-trade price on the same
+  market) rather than alerting on dollar size alone — catches large trades
+  against deep books that don't actually move anything, and small trades
+  against thin books that move a lot.
+- **Multi-wallet correlation across time.** Detect clusters of wallets that
+  repeatedly land on the same side of the same markets across *many*
+  markets, not just one (the existing `market_convergence` is single-market
+  only) — could indicate coordinated wallets or one person operating
+  several addresses.
+- **Rate-limit/backoff tuning for the scout scripts.** Both
+  `scout_leaderboard.py` and (once built) `category_scout.py` use a flat
+  `--pause` between calls. A real backoff (exponential on 429/5xx, shorter
+  pause on success) would let `--top 300` runs go faster without risking a
+  ban.
 
-```python
-class WalletPosition(Base):
-    __tablename__ = "wallet_positions"
-
-    id           = Column(Integer, primary_key=True)
-    address      = Column(String(64), index=True)
-    condition_id = Column(String(128), index=True)
-    title        = Column(String(512), default="")
-    outcome      = Column(String(128), default="")
-    size         = Column(Float, default=0.0)
-    avg_price    = Column(Float, default=0.0)
-    cur_price    = Column(Float, default=0.0)
-    current_value= Column(Float, default=0.0)
-    cash_pnl     = Column(Float, default=0.0)
-    percent_pnl  = Column(Float, default=0.0)
-    synced_at    = Column(DateTime, index=True)
-```
-
-Helpers:
-
-- `replace_wallet_positions(session, address, positions: list)` — delete this
-  address's rows, insert the new list, one commit. (Field mapping from the
-  data-api positions payload: `title`, `outcome`, `size`, `avgPrice`,
-  `curPrice`, `currentValue`, `cashPnl`, `percentPnl`, `conditionId`.)
-- `get_wallet_positions(session, address) -> list[WalletPosition]`
-- `positions_summary_db(session, addresses: list) -> dict` — one grouped query:
-  `{address: {"value": sum(current_value), "pnl": sum(cash_pnl), "count": n, "synced_at": max}}`.
-
-### 3.2 Position-sync job (new file: `sync_positions.py`)
-
-Same standalone-script shape as `resolve_markets.py`:
-
-```
-python sync_positions.py             # one pass: sync all watched addresses
-python sync_positions.py --loop 300  # every 5 min
-```
-
-Per pass: for each `watched_address`, GET `{DATA_API}/positions?user=<addr>&limit=100`
-(reuse the retry helper), `replace_wallet_positions(...)`, sleep `--pause`
-(default 0.3s) between wallets. After syncing a wallet, write a
-`WalletPnlSnapshot` if the 6-hour gate allows (Phase 2.2).
-
-**Alternative accepted:** instead of a third/fourth process, fold both the
-resolution check and the position sync into `main.py`'s loop — run them every
-N cycles (e.g. resolution every 20 cycles ≈ 10 min, positions every 10 cycles).
-Simpler to deploy (no new Railway service). Implement as functions imported from
-`resolve_markets.py` / `sync_positions.py` so both modes work; add config keys:
-
-```yaml
-jobs:
-  resolve_every_cycles: 20    # 0 = disabled in worker (run standalone instead)
-  positions_every_cycles: 10
-```
-
-Prefer the in-worker mode as the default — it keeps the Railway topology at two
-services.
-
-### 3.3 Dashboard reads DB instead of the API (`dashboard.py`)
-
-- `/watchlist`: replace the `fetch_positions` loop with one
-  `positions_summary_db(session, [a.address for a in addresses])` call inside
-  the existing session block. Show a muted "synced Xm ago" note (from max
-  `synced_at`) under the table header. If a wallet has never been synced, show
-  "—" rather than calling the API inline.
-- `/wallet/<address>`: read `get_wallet_positions()` from the DB. Keep
-  `fetch_positions()` as a fallback ONLY when the DB has zero rows for the
-  address AND the address is not watched (random feed wallet the sync job never
-  covers) — that keeps per-wallet pages useful for unknown whales without
-  slowing the watchlist page.
-- Delete the `_positions_cache` TTL machinery once the above works (or keep it
-  only for the unknown-wallet fallback path).
-
----
-
-## Phase 4 — Market pages: who's in a contract (tracked vs unknown)
-
-**Why (user's ask):** "track contracts so that we can see who is in it, like
-known/unknown users versus tracked users."
-
-### 4.1 `db.py`
-
-```python
-def market_participants(session, condition_id: str) -> dict:
-    """Everyone we've seen trade this market.
-    Returns {"watched": [...], "unknown": [...]} where each entry is
-    {address, label_or_tag, trades, volume, outcomes: {outcome_side: usd}, last_traded}.
-    'watched' = address in watched_addresses; 'unknown' = everyone else."""
-```
-
-Pull from BOTH `whale_trades` (filter `condition_id`) and `watched_trades`,
-merge per address (dedupe on trade_id like 2.1), then split by membership in
-`watched_addresses`.
-
-### 4.2 New route `/market/<condition_id>` (`dashboard.py`)
-
-- Header: market title, category, resolved badge (`✅ Resolved: <outcome>` or
-  `🟢 Open`), end date — from the `markets` table.
-- Two tables: "Watched wallets in this market" and "Other wallets", both from
-  `market_participants()`, columns: wallet (link to `/wallet/`), label/tag,
-  position(s) (outcome+side with $ each), total $, last trade, and result
-  (WIN/LOSS once resolved).
-- Link market titles to this page everywhere a market is shown (`/`,
-  `/watchlist` convergence table, `/wallet/...` top-markets table). The trades
-  already carry `condition_id`; where a table only has the title (e.g.
-  `wallet_market_breakdown`), add `condition_id` to the query's group-by/output.
-- Add a "Markets" index page `/markets` listing markets from the `markets`
-  table: title, category, open/resolved, watched-wallet count, total tracked $,
-  sortable open-first. Add it to the nav.
-
----
-
-## Phase 5 — Formalize tracked vs unknown wallets
-
-**Why (user's ask):** "track users we want to track as well as unknown users who
-pop up in the feed." Most of this exists (`wallets` = anyone seen in the feed,
-`watched_addresses` = explicit follows) — what's missing is promotion flow and
-visibility.
-
-- [ ] Add `is_watched` awareness to the main feed page: in the recent-trades
-  table on `/`, show a 👀 marker next to wallets that are on the watchlist
-  (one query for the watched set, check membership in the template).
-- [ ] "Unknown wallets worth a look" card on `/watchlist`: top 10 wallets from
-  `wallets` NOT in the watchlist, ranked by `total_usd`, each with a one-click
-  "👀 Watch" button (the `/watchlist/add` form already exists on
-  `/leaderboard` — reuse that pattern).
-- [ ] Wallet record columns (from Phase 2) on both the `/leaderboard` and the
-  top-wallets card so "unknown" wallets show their track record before you
-  decide to watch them.
-- [ ] Scheduled scout: document (README + `railway.json` note) running
-  `python scout_leaderboard.py` on Railway cron weekly. Add `--max-keep-total`
-  guard: skip adding if the watchlist already has ≥ N entries (avoid unbounded
-  growth). Default 100.
-
----
-
-## Phase 6 — Robustness / housekeeping (smaller, independent items)
-
-- [ ] **JSON API endpoints** so the UI (or anything else) can poll without a
-  full page render: `/api/stats`, `/api/trades?limit=&q=&category=&wallet=`,
-  `/api/watchlist`, `/api/market/<condition_id>`. Return the same dicts the
-  templates use; use Flask `jsonify`. Keep the HTML pages server-rendered.
-- [ ] **Pagination** on `/` trades table (`?page=N`, 100/page, prev/next links)
-  — right now it silently truncates at 100.
-- [ ] **DB indexes**: composite index on `whale_trades (condition_id, side, traded_at)`
-  (used by the consensus query every whale trade) and `whale_trades (wallet, traded_at)`.
-  New-table indexes are covered above. Needs migration for existing deployments
-  (`migrate_003_indexes.py`) — `CREATE INDEX IF NOT EXISTS` works on both engines.
-- [ ] **Retention**: optional `retention_days` config (default 0 = keep forever);
-  a `prune_old_trades(session, days)` helper called once per worker start and
-  daily thereafter. Never prune `watched_trades` (that's the user's own record) —
-  only `whale_trades` older than the cutoff **whose market is resolved**.
-- [ ] **Tests** (README already wants them): `pytest`, in-memory SQLite
-  (`db.init_db("sqlite:///:memory:")`). Priority order:
-  1. `settle_market_trades` — all 4 side/outcome combinations + idempotency.
-  2. `wallet_record` — dedupe across the two trade tables, PnL math.
-  3. Resolution parsing — feed the checker canned Gamma payloads
-     (`closed`, `outcomePrices` as JSON strings, malformed JSON).
-  4. `matches_filters`, `trade_unique_id`, `parse_trade_usd_size` (pure functions
-     in `main.py`).
-  Add `pytest` to a new `requirements-dev.txt`.
-- [ ] **Alert dedupe across restarts**: `SeenTrades` starts empty on every worker
-  restart and the first fetch is alert-suppressed (`first_run`), which is fine —
-  but trades that occur *while the worker is down* are never recorded. Optional:
-  on startup, backfill `seen` from the last 1000 `trade_id`s in `whale_trades` +
-  `watched_trades`, then process (not suppress) the first fetch. Low priority.
-- [ ] **Telegram/Discord alert for resolutions of watched positions**: when
-  `settle_market_trades` settles any `watched_trades` rows, send one summary
-  alert per market: "🏁 Market resolved: <title> → <outcome>. Sharp Sam: WIN
-  +$412, 0x12ab…: LOSS −$1,200." Reuse the send helpers from `main.py` — move
-  `send_telegram_alert` / `send_discord_alert` into a new `notify.py` shared
-  module so `resolve_markets.py` doesn't import all of `main.py`.
-- [ ] **WebSocket feed** (`wss://ws-subscriptions-clob.polymarket.com/ws/market`)
-  instead of polling — big item, keep last; the polling loop works.
-
----
-
-## Suggested implementation order
-
-1. Phase 1 (markets + resolution + settlement) — everything else builds on it.
-2. Phase 3 (position sync + fast watchlist page) — fixes the user-visible lag.
-3. Phase 2 (records + realized PnL) — needs Phase 1's `result` columns.
-4. Phase 4 (market pages), then Phase 5, then Phase 6 items in any order.
-
-Each phase should land as its own commit(s) with the migration script (if any)
-committed alongside the model change, and a README feature-list update.
+Not carried forward from the old list (still valid ideas, just no new
+information to add beyond what was already written): Streamlit analytics
+mode, WebSocket feed instead of polling, backtest mode. Revisit those if
+they become priorities — the earlier reasoning for deferring them
+(polling works fine, WebSocket is a bigger architectural change) still
+holds.
