@@ -127,6 +127,10 @@ Or edit `config.yaml` directly. Environment variables take priority.
 - ✅ Market pages (`/markets`, `/market/<condition_id>`) — see who's in a market, split into watched wallets vs. unknown ones, with resolution status
 - ✅ "Unknown wallets worth a look" — top feed wallets not yet on the watchlist, one click to start watching
 - ✅ Paginated trade history on the live feed (`?page=N`)
+- ✅ Resolution alerts — Telegram/Discord message summarizing WIN/LOSS + P&L when a market with watched-wallet activity resolves
+- ✅ JSON API (`/api/stats`, `/api/trades`, `/api/watchlist`, `/api/market/<condition_id>`) for programmatic access
+- ✅ Configurable data retention (`RETENTION_DAYS`) — prune resolved-market trades past a cutoff to keep the database lean
+- ✅ Automated pytest suite covering settlement, wallet PnL math, and resolution parsing
 
 ---
 
@@ -306,15 +310,19 @@ Good first issues:
 - [x] Smart-money consensus + accumulation alerts
 - [x] Tracker heartbeat / `/health` endpoint
 - [x] Leaderboard scout — auto-populate the watchlist from Polymarket's real top traders, vetted by win rate
-- [ ] Wallet PnL tracking over time (is a whale's win rate trending up or down, not just a point-in-time number)
+- [x] Market resolution tracking + settled win/loss records + realized P&L (`resolve_markets.py`)
+- [x] Position sync so `/watchlist` doesn't hit the live API on every page load (`sync_positions.py`)
+- [x] Market pages — who's in a market, watched vs. unknown wallets (`/markets`, `/market/<condition_id>`)
+- [x] Scheduled/automated leaderboard scout runs (cron-safe via `--max-keep-total`, documented under [Deploy to Railway](#-deploy-to-railway))
+- [x] Test suite (`tests/` — settlement, wallet PnL/dedup math, resolution parsing, main.py pure functions)
+- [ ] Wallet PnL trend chart — `wallet_pnl_snapshots` are already being collected by `sync_positions.py`; no chart on `/wallet/<address>` surfaces the trend yet
 - [ ] Streamlit analytics mode (charts over historical whale data)
 - [ ] WebSocket feed instead of polling
-- [ ] Scheduled/automated leaderboard scout runs (cron, so the watchlist stays fresh without a manual re-run)
 - [ ] Slippage-aware alerting (surface whether a whale's trade meaningfully moved the price, not just its dollar size)
 - [ ] Multi-wallet correlation across time (same cluster of wallets repeatedly moving together, beyond a single market)
 - [ ] Backtest mode — replay historical trades through the alert rules to tune thresholds before going live
-- [ ] Test suite (no automated tests currently cover the alert/consensus/accumulation logic)
 - [ ] Rate-limit / backoff tuning for the leaderboard scout (currently a flat `--pause` between calls)
+- [ ] Per-category leaderboard scout — see `todo.md` for the planned `category_scout.py`
 
 Open an issue or send a PR — both welcome.
 
